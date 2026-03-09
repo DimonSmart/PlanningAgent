@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path="tests.runsettings" />
+  </Folder>
+  <Project Path="PlanningAgentDemo.Tests/PlanningAgentDemo.Tests.csproj" />
+  <Project Path="PlanningAgentDemo/PlanningAgentDemo.csproj" />
+</Solution>
