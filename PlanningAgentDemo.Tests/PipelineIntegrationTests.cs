@@ -3,8 +3,10 @@ using System.Text.Json.Nodes;
 using PlanningAgentDemo.Agents;
 using PlanningAgentDemo.Common;
 using PlanningAgentDemo.Execution;
+using PlanningAgentDemo.Orchestration;
 using PlanningAgentDemo.Planning;
 using PlanningAgentDemo.Tools;
+using PlanningAgentDemo.Verification;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -138,28 +140,35 @@ public class PipelineTests(ITestOutputHelper output)
         Assert.NotNull(answer);
     }
 
-    // -- Test 2: Full pipeline  userQuery > LlmPlanner > Executor ----------
+    // -- Test 2: Full pipeline  userQuery > Planner > Orchestrator ----------
 
     /// <summary>
-    /// The LLM planner generates the full plan (including agent prompts) from the user query.
-    /// The executor then runs it. This validates the whole chain end-to-end.
+    /// The LLM planner generates the full plan from the user query and the orchestrator
+    /// drives planning, execution, verification, and replanning. This validates the
+    /// system-level outcome instead of raw step success.
     /// </summary>
     [Fact]
-    public async Task FullPipeline_PlannerGeneratesPlan_ExecutorRunsIt()
+    public async Task FullPipeline_PlannerAndOrchestrator_ReturnsSystemOutcome()
     {
         var llm = BuildLlm(longTimeout: true);
         var planner = new LlmPlanner(llm, BuildTools(), new TestLogger(output));
         var runner = new AgentStepRunner(llm);
         var executor = new PlanExecutor(BuildTools(), runner, new TestLogger(output));
+        var orchestrator = new PlanningOrchestrator(
+            planner,
+            executor,
+            new GoalVerifier(askUserEnabled: true),
+            new TestLogger(output),
+            maxAttempts: 3);
 
         const string userQuery = "I'm looking for a good robot vacuum cleaner. Can you find two popular models, check their specs, and tell me which one is better?";
 
         output.WriteLine($"User query: {userQuery}");
 
-        PlanDefinition plan;
+        PlanDefinition initialPlan;
         try
         {
-            plan = await planner.CreatePlanAsync(userQuery);
+            initialPlan = await planner.CreatePlanAsync(userQuery);
         }
         catch (Exception ex)
         {
@@ -168,20 +177,327 @@ public class PipelineTests(ITestOutputHelper output)
         }
 
         output.WriteLine($"\n=== GENERATED PLAN ===");
-        output.WriteLine(JsonSerializer.Serialize(plan, new JsonSerializerOptions { WriteIndented = true }));
+        output.WriteLine(JsonSerializer.Serialize(initialPlan, new JsonSerializerOptions { WriteIndented = true }));
+
+        var result = await orchestrator.RunAsync(userQuery);
+        var outcome = ClassifyOutcome(result);
+
+        output.WriteLine($"\n=== SYSTEM OUTCOME ===\n{outcome}");
+        if (result.Ok)
+            output.WriteLine($"\n=== FINAL ANSWER ===\n{result.Data?.ToJsonString(new JsonSerializerOptions { WriteIndented = true })}");
+        else
+            output.WriteLine($"\n=== OUTCOME DETAILS ===\ncode={result.Error?.Code}\nmessage={result.Error?.Message}\ndetails={result.Error?.Details?.ToJsonString(new JsonSerializerOptions { WriteIndented = true })}");
+
+        switch (outcome)
+        {
+            case GoalAction.Done:
+                Assert.True(result.Ok);
+                Assert.NotNull(result.Data);
+                break;
+
+            case GoalAction.AskUser:
+                Assert.False(result.Ok);
+                Assert.Equal("ask_user", result.Error?.Code);
+                Assert.NotNull(result.Error?.Details);
+                Assert.True(result.Error!.Details!.ContainsKey("question"));
+                break;
+
+            case GoalAction.Replan:
+                Assert.False(result.Ok);
+                Assert.NotNull(result.Error);
+                Assert.False(string.IsNullOrWhiteSpace(result.Error!.Message));
+                break;
+
+            default:
+                throw new InvalidOperationException($"Unexpected outcome: {outcome}");
+        }
+    }
+
+    [Fact]
+    public void GoalVerifier_UsesLastStepOutputInsteadOfHardcodedFinalKey()
+    {
+        var plan = new PlanDefinition
+        {
+            Goal = "Produce an answer.",
+            Steps =
+            [
+                new PlanStep { Id = "search", Tool = "search", In = new() { ["query"] = JsonValue.Create("x") } },
+                new PlanStep { Id = "compare", Llm = "compare", UserPrompt = "Compare.", In = new() }
+            ]
+        };
+
+        var executionResult = new ExecutionResult
+        {
+            StepTraces =
+            [
+                new StepExecutionTrace { StepId = "search", Success = true },
+                new StepExecutionTrace { StepId = "compare", Success = true }
+            ]
+        };
 
         var store = new ExecutionStore();
-        var result = await executor.ExecuteAsync(plan, store);
+        store.Set("compare", JsonValue.Create("final answer"));
 
-        foreach (var t in result.StepTraces)
-            output.WriteLine($"  step={t.StepId} success={t.Success} err={t.ErrorMessage}");
+        var verdict = new GoalVerifier().Check(plan, executionResult, store);
 
-        Assert.True(result.StepTraces.All(t => t.Success),
-            $"Failed step: {result.LastEnvelope?.Error?.Message}");
+        Assert.Equal(GoalAction.Done, verdict.Action);
+    }
 
-        var lastId = plan.Steps[^1].Id;
-        store.TryGet(lastId, out var final);
-        output.WriteLine($"\n=== FINAL ANSWER ({lastId}) ===\n{final?.ToString()}");
-        Assert.NotNull(final);
+    [Fact]
+    public async Task Orchestrator_FailsWhenIntermediateStepLooksIncomplete()
+    {
+        var plan = new PlanDefinition
+        {
+            Goal = "Extract and compare data.",
+            Steps =
+            [
+                new PlanStep
+                {
+                    Id = "extract",
+                    Llm = "extract",
+                    SystemPrompt = "Return valid JSON only.",
+                    UserPrompt = "Extract fields.",
+                    In = new() { ["item"] = JsonValue.Create("stub") },
+                    Out = "json"
+                },
+                new PlanStep
+                {
+                    Id = "compare",
+                    Llm = "compare",
+                    SystemPrompt = "Return plain text.",
+                    UserPrompt = "Compare items.",
+                    In = new() { ["items"] = JsonValue.Create("$extract") },
+                    Out = "string"
+                }
+            ]
+        };
+
+        var planner = new StubPlanner(plan);
+        var runner = new StubAgentRunner(
+            new JsonObject
+            {
+                ["model"] = "",
+                ["summary"] = ""
+            },
+            JsonValue.Create("comparison"));
+        var executor = new PlanExecutor(BuildTools(), runner, new TestLogger(output));
+        var orchestrator = new PlanningOrchestrator(planner, executor, new GoalVerifier(), new TestLogger(output));
+
+        var result = await orchestrator.RunAsync("compare items");
+
+        Assert.False(result.Ok);
+        Assert.Equal("goal_not_achieved", result.Error?.Code);
+        Assert.Contains("incomplete", result.Error?.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Orchestrator_ReplansWithExecutionContext_AndSucceeds()
+    {
+        var firstPlan = new PlanDefinition
+        {
+            Goal = "Produce an answer.",
+            Steps =
+            [
+                new PlanStep
+                {
+                    Id = "extract",
+                    Llm = "extract",
+                    SystemPrompt = "Return valid JSON only.",
+                    UserPrompt = "Extract data.",
+                    In = new() { ["input"] = JsonValue.Create("x") },
+                    Out = "json"
+                }
+            ]
+        };
+
+        var secondPlan = new PlanDefinition
+        {
+            Goal = "Produce an answer.",
+            Steps =
+            [
+                new PlanStep
+                {
+                    Id = "final_answer",
+                    Llm = "answer",
+                    SystemPrompt = "Return valid JSON only.",
+                    UserPrompt = "Answer.",
+                    In = new() { ["input"] = JsonValue.Create("x") },
+                    Out = "json"
+                }
+            ]
+        };
+
+        var planner = new StubReplanPlanner(firstPlan, secondPlan);
+        var runner = new StubAgentRunner(
+            new JsonObject { ["field"] = "" },
+            new JsonObject { ["answer"] = "done" });
+        var executor = new PlanExecutor(BuildTools(), runner, new TestLogger(output));
+        var orchestrator = new PlanningOrchestrator(planner, executor, new GoalVerifier(), new TestLogger(output), maxAttempts: 2);
+
+        var result = await orchestrator.RunAsync("answer the user query");
+
+        Assert.True(result.Ok);
+        Assert.NotNull(result.Data);
+        Assert.Single(planner.ReplanRequests);
+        Assert.Contains(planner.ReplanRequests[0].ExecutionResult.StepTraces[0].VerificationIssues,
+            issue => issue.Code == "structurally_empty_output");
+    }
+
+    [Fact]
+    public async Task AgentStepRunner_ReturnsFailure_WhenAgentReportsStructuredExecutionIssue()
+    {
+        var llm = new StubLlmClient("""
+        {
+          "_execution": {
+            "status": "blocked",
+            "needsReplan": true,
+            "errors": [
+              { "code": "insufficient_input", "message": "The provided data is not enough." }
+            ]
+          },
+          "result": null
+        }
+        """);
+        var runner = new AgentStepRunner(llm);
+
+        var step = new PlanStep
+        {
+            Id = "extract",
+            Llm = "extract",
+            SystemPrompt = "Return valid JSON only.",
+            UserPrompt = "Extract data.",
+            In = new() { ["input"] = JsonValue.Create("x") },
+            Out = "json"
+        };
+
+        var result = await runner.ExecuteAsync(step, new JsonObject { ["input"] = "x" });
+
+        Assert.False(result.Ok);
+        Assert.Equal("llm_reported_issue", result.Error?.Code);
+        Assert.Equal("blocked", result.Error?.Details?["status"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Orchestrator_PassesStructuredAgentErrors_ToReplanner()
+    {
+        var firstPlan = new PlanDefinition
+        {
+            Goal = "Produce an answer.",
+            Steps =
+            [
+                new PlanStep
+                {
+                    Id = "extract",
+                    Llm = "extract",
+                    SystemPrompt = "Return valid JSON only.",
+                    UserPrompt = "Extract data.",
+                    In = new() { ["input"] = JsonValue.Create("x") },
+                    Out = "json"
+                }
+            ]
+        };
+
+        var secondPlan = new PlanDefinition
+        {
+            Goal = "Produce an answer.",
+            Steps =
+            [
+                new PlanStep
+                {
+                    Id = "final_answer",
+                    Llm = "answer",
+                    SystemPrompt = "Return valid JSON only.",
+                    UserPrompt = "Answer.",
+                    In = new() { ["input"] = JsonValue.Create("x") },
+                    Out = "json"
+                }
+            ]
+        };
+
+        var planner = new StubReplanPlanner(firstPlan, secondPlan);
+        var llm = new SequenceLlmClient(
+            """
+            {
+              "_execution": {
+                "status": "blocked",
+                "needsReplan": true,
+                "errors": [
+                  { "code": "insufficient_input", "message": "The provided data is not enough." }
+                ]
+              },
+              "result": null
+            }
+            """,
+            """
+            {
+              "answer": "done"
+            }
+            """);
+        var runner = new AgentStepRunner(llm);
+        var executor = new PlanExecutor(BuildTools(), runner, new TestLogger(output));
+        var orchestrator = new PlanningOrchestrator(planner, executor, new GoalVerifier(), new TestLogger(output), maxAttempts: 2);
+
+        var result = await orchestrator.RunAsync("answer the user query");
+
+        Assert.True(result.Ok);
+        Assert.Single(planner.ReplanRequests);
+        var trace = Assert.Single(planner.ReplanRequests[0].ExecutionResult.StepTraces);
+        Assert.Equal("llm_reported_issue", trace.ErrorCode);
+        Assert.Equal("blocked", trace.ErrorDetails?["status"]?.GetValue<string>());
+    }
+
+    private sealed class StubPlanner(PlanDefinition plan) : IPlanner
+    {
+        public Task<PlanDefinition> CreatePlanAsync(string userQuery, CancellationToken cancellationToken = default) =>
+            Task.FromResult(plan);
+    }
+
+    private sealed class StubReplanPlanner(PlanDefinition initialPlan, PlanDefinition replannedPlan) : IReplanCapablePlanner
+    {
+        public List<PlannerReplanRequest> ReplanRequests { get; } = [];
+
+        public Task<PlanDefinition> CreatePlanAsync(string userQuery, CancellationToken cancellationToken = default) =>
+            Task.FromResult(initialPlan);
+
+        public Task<PlanDefinition> ReplanAsync(PlannerReplanRequest request, CancellationToken cancellationToken = default)
+        {
+            ReplanRequests.Add(request);
+            return Task.FromResult(replannedPlan);
+        }
+    }
+
+    private sealed class StubAgentRunner(params JsonNode?[] outputs) : IAgentStepRunner
+    {
+        private readonly Queue<JsonNode?> _outputs = new(outputs.Select(output => output?.DeepClone()));
+
+        public Task<ResultEnvelope<JsonNode?>> ExecuteAsync(PlanStep step, JsonObject resolvedInputs, CancellationToken cancellationToken = default)
+        {
+            var output = _outputs.Dequeue();
+            return Task.FromResult(ResultEnvelope<JsonNode?>.Success(output?.DeepClone()));
+        }
+    }
+
+    private sealed class StubLlmClient(string response) : ILlmClient
+    {
+        public Task<string> GenerateAsync(string systemPrompt, string userPrompt, CancellationToken cancellationToken = default) =>
+            Task.FromResult(response);
+    }
+
+    private sealed class SequenceLlmClient(params string[] responses) : ILlmClient
+    {
+        private readonly Queue<string> _responses = new(responses);
+
+        public Task<string> GenerateAsync(string systemPrompt, string userPrompt, CancellationToken cancellationToken = default) =>
+            Task.FromResult(_responses.Dequeue());
+    }
+
+    private static GoalAction ClassifyOutcome(ResultEnvelope<JsonNode?> result)
+    {
+        if (result.Ok)
+            return GoalAction.Done;
+
+        return string.Equals(result.Error?.Code, "ask_user", StringComparison.Ordinal)
+            ? GoalAction.AskUser
+            : GoalAction.Replan;
     }
 }

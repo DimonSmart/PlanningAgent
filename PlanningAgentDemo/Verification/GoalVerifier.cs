@@ -18,33 +18,71 @@ public sealed class GoalVerifier(bool askUserEnabled = false)
             };
         }
 
-        if (!store.TryGet("final", out var finalNode) || finalNode is null)
+        var verificationIssues = executionResult.StepTraces
+            .Where(trace => trace.VerificationIssues.Count > 0)
+            .SelectMany(trace => trace.VerificationIssues.Select(issue => $"{trace.StepId}:{issue.Code}"))
+            .ToList();
+
+        if (verificationIssues.Count > 0)
         {
             return new GoalVerdict
             {
                 Action = GoalAction.Replan,
-                Reason = "Store does not contain final result.",
-                Missing = ["final"]
+                Reason = "Execution completed, but one or more step outputs look incomplete.",
+                Missing = verificationIssues
             };
         }
 
-        if (finalNode is not JsonObject finalObj || finalObj.Count == 0)
+        var lastStepId = plan.Steps[^1].Id;
+        if (!store.TryGet(lastStepId, out var finalNode) || finalNode is null)
         {
             return new GoalVerdict
             {
                 Action = GoalAction.Replan,
-                Reason = "Final output does not match minimal expected structure.",
-                Missing = ["final_structure"]
+                Reason = $"Store does not contain final result for step '{lastStepId}'.",
+                Missing = [lastStepId]
             };
         }
 
-        if (askUserEnabled && finalObj["needUserInput"]?.GetValue<bool>() == true)
+        if (finalNode is JsonObject finalObj && finalObj.Count == 0)
+        {
+            return new GoalVerdict
+            {
+                Action = GoalAction.Replan,
+                Reason = "Final output is an empty object.",
+                Missing = ["final_content"]
+            };
+        }
+
+        if (finalNode is JsonArray finalArray && finalArray.Count == 0)
+        {
+            return new GoalVerdict
+            {
+                Action = GoalAction.Replan,
+                Reason = "Final output is an empty array.",
+                Missing = ["final_content"]
+            };
+        }
+
+        if (finalNode is JsonValue finalValue
+            && finalValue.TryGetValue<string>(out var finalText)
+            && string.IsNullOrWhiteSpace(finalText))
+        {
+            return new GoalVerdict
+            {
+                Action = GoalAction.Replan,
+                Reason = "Final output is an empty string.",
+                Missing = ["final_content"]
+            };
+        }
+
+        if (askUserEnabled && finalNode is JsonObject askUserObject && askUserObject["needUserInput"]?.GetValue<bool>() == true)
         {
             return new GoalVerdict
             {
                 Action = GoalAction.AskUser,
                 Reason = "Need clarification from user.",
-                UserQuestion = finalObj["question"]?.GetValue<string>()
+                UserQuestion = askUserObject["question"]?.GetValue<string>()
             };
         }
 

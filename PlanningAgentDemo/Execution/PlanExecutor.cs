@@ -3,6 +3,7 @@ using PlanningAgentDemo.Agents;
 using PlanningAgentDemo.Common;
 using PlanningAgentDemo.Planning;
 using PlanningAgentDemo.Tools;
+using PlanningAgentDemo.Verification;
 
 namespace PlanningAgentDemo.Execution;
 
@@ -58,6 +59,9 @@ public sealed class PlanExecutor(
                 lastEnvelope = envelope;
 
                 if (!trace.Success)
+                    return new ExecutionResult { StepTraces = traces, LastEnvelope = lastEnvelope };
+
+                if (trace.VerificationIssues.Count > 0)
                     return new ExecutionResult { StepTraces = traces, LastEnvelope = lastEnvelope };
 
                 pending.Remove(step.Id);
@@ -125,6 +129,16 @@ public sealed class PlanExecutor(
         }
 
         bool success = lastEnv?.Ok ?? false;
+        List<StepVerificationIssue> verificationIssues = [];
+
+        if (success)
+        {
+            store.TryGet(step.Id, out var storedOutput);
+            verificationIssues = StepOutputVerifier.Verify(step, storedOutput);
+            foreach (var issue in verificationIssues)
+                _log.Log($"[verify] step={step.Id} code={issue.Code} message={issue.Message}");
+        }
+
         _log.Log($"[exec] step:end id={step.Id} success={success} calls={calls.Count} error={Shorten(lastEnv?.Error?.Message, 240)}");
 
         var trace = new StepExecutionTrace
@@ -132,7 +146,9 @@ public sealed class PlanExecutor(
             StepId = step.Id,
             Success = success,
             ErrorCode = success ? null : lastEnv?.Error?.Code,
-            ErrorMessage = success ? null : lastEnv?.Error?.Message
+            ErrorMessage = success ? null : lastEnv?.Error?.Message,
+            ErrorDetails = success ? null : lastEnv?.Error?.Details,
+            VerificationIssues = verificationIssues
         };
         foreach (var c in calls) trace.Calls.Add(c);
 

@@ -53,6 +53,17 @@ public sealed class ExecutionStore
         return payload;
     }
 
+    public JsonObject CreateSnapshot()
+    {
+        var snapshot = new JsonObject();
+        foreach (var pair in _values.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+        {
+            snapshot[pair.Key] = pair.Value?.DeepClone();
+        }
+
+        return snapshot;
+    }
+
     private void AppendSingle(string key, JsonArray array, JsonNode? item)
     {
         var clone = item?.DeepClone();

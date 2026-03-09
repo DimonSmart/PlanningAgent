@@ -15,22 +15,21 @@ namespace PlanningAgentDemo.Planning;
 public sealed class LlmPlanner(
   ILlmClient llmClient,
   IToolRegistry toolRegistry,
-  IExecutionLogger? executionLogger = null) : IPlanner
+  IExecutionLogger? executionLogger = null) : IReplanCapablePlanner
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
   private readonly IExecutionLogger _log = executionLogger ?? NullExecutionLogger.Instance;
 
     public async Task<PlanDefinition> CreatePlanAsync(string userQuery, CancellationToken cancellationToken = default)
     {
-        var tools = toolRegistry.ListPlannerMetadata();
-        var systemPrompt = BuildSystemPrompt(tools);
-    _log.Log($"[plan] create:start toolCount={tools.Count} query={Shorten(userQuery, 240)}");
-        var raw = await llmClient.GenerateAsync(systemPrompt, userQuery, cancellationToken);
-        var plan = ParsePlan(raw);
-        PlanValidator.ValidateOrThrow(plan);
-    _log.Log($"[plan] create:success steps={plan.Steps.Count} goal={Shorten(plan.Goal, 240)}");
-    _log.Log($"[plan] create:json {JsonSerializer.Serialize(plan, new JsonSerializerOptions { WriteIndented = true })}");
-        return plan;
+      _log.Log($"[plan] create:start toolCount={toolRegistry.ListPlannerMetadata().Count} query={Shorten(userQuery, 240)}");
+      return await GeneratePlanCoreAsync(BuildPlanningUserPrompt(userQuery), isReplan: false, cancellationToken);
+    }
+
+    public async Task<PlanDefinition> ReplanAsync(PlannerReplanRequest request, CancellationToken cancellationToken = default)
+    {
+      _log.Log($"[plan] replan:start attempt={request.AttemptNumber} reason={Shorten(request.GoalVerdict.Reason, 240)}");
+      return await GeneratePlanCoreAsync(BuildReplanUserPrompt(request), isReplan: true, cancellationToken);
     }
 
   private static string Shorten(string? value, int maxLength)
@@ -44,10 +43,29 @@ public sealed class LlmPlanner(
       : $"{normalized[..maxLength]}...";
   }
 
-    private static string BuildSystemPrompt(IReadOnlyCollection<ToolPlannerMetadata> tools)
+    private async Task<PlanDefinition> GeneratePlanCoreAsync(string userPrompt, bool isReplan, CancellationToken cancellationToken)
+    {
+      var tools = toolRegistry.ListPlannerMetadata();
+      var systemPrompt = BuildSystemPrompt(tools, isReplan);
+      var raw = await llmClient.GenerateAsync(systemPrompt, userPrompt, cancellationToken);
+      var plan = ParsePlan(raw);
+      PlanValidator.ValidateOrThrow(plan);
+
+      _log.Log($"[plan] {(isReplan ? "replan" : "create")}:success steps={plan.Steps.Count} goal={Shorten(plan.Goal, 240)}");
+      _log.Log($"[plan] {(isReplan ? "replan" : "create")}:json {JsonSerializer.Serialize(plan, new JsonSerializerOptions { WriteIndented = true })}");
+      return plan;
+    }
+
+    private static string BuildSystemPrompt(IReadOnlyCollection<ToolPlannerMetadata> tools, bool isReplan)
     {
         var sb = new StringBuilder();
         sb.AppendLine("You are a planning agent. Given a user request, produce a JSON execution plan.");
+      if (isReplan)
+      {
+        sb.AppendLine("You are replanning after a previous execution attempt failed or produced incomplete outputs.");
+        sb.AppendLine("Use the previous plan, step traces, verification issues, and available store snapshot to produce a corrected NEW plan.");
+        sb.AppendLine("You may change step structure, prompts, and tool usage completely. Do not simply repeat the failing plan blindly.");
+      }
         sb.AppendLine("A plan is an ordered list of workflow steps. There are exactly two kinds of steps:");
         sb.AppendLine();
         sb.AppendLine("## Kind 1 - Tool steps  (field: \"tool\": \"<name>\")");
@@ -129,6 +147,23 @@ public sealed class LlmPlanner(
         sb.AppendLine("- When out is \"json\", the systemPrompt MUST state that only valid JSON should be returned.");
         sb.AppendLine("- Output ONLY the raw JSON plan. No markdown fences, no explanation.");
         return sb.ToString();
+    }
+
+    private static string BuildPlanningUserPrompt(string userQuery) => userQuery;
+
+    private static string BuildReplanUserPrompt(PlannerReplanRequest request)
+    {
+        var context = new JsonObject
+        {
+            ["userQuery"] = request.UserQuery,
+            ["attemptNumber"] = request.AttemptNumber,
+            ["previousPlan"] = JsonSerializer.SerializeToNode(request.PreviousPlan),
+            ["executionResult"] = JsonSerializer.SerializeToNode(request.ExecutionResult),
+            ["goalVerdict"] = JsonSerializer.SerializeToNode(request.GoalVerdict),
+            ["storeSnapshot"] = request.StoreSnapshot.DeepClone()
+        };
+
+        return $"The previous attempt did not achieve the goal. Analyze the execution context below and produce a corrected NEW plan from scratch. Focus on fixing the failed or incomplete steps while keeping the plan generic and tool-grounded.\n\nReplan context:\n{context.ToJsonString(new JsonSerializerOptions { WriteIndented = true })}";
     }
 
     private static PlanDefinition ParsePlan(string raw)
