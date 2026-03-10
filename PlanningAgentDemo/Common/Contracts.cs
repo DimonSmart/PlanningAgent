@@ -1,4 +1,4 @@
-using System.Text.Json.Nodes;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace PlanningAgentDemo.Common;
@@ -6,7 +6,13 @@ namespace PlanningAgentDemo.Common;
 public sealed record ErrorInfo(
     [property: JsonPropertyName("code")] string Code,
     [property: JsonPropertyName("message")] string Message,
-    [property: JsonPropertyName("details")] JsonObject? Details = null);
+    [property: JsonPropertyName("details")] JsonElement? Details = null);
+
+public sealed record LlmFailureDetails(
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("needsReplan")] bool NeedsReplan,
+    [property: JsonPropertyName("missingFacts")] string[] MissingFacts,
+    [property: JsonPropertyName("observedEvidence")] string[] ObservedEvidence);
 
 public sealed record ResultEnvelope<T>(
     [property: JsonPropertyName("ok")] bool Ok,
@@ -15,6 +21,17 @@ public sealed record ResultEnvelope<T>(
 {
     public static ResultEnvelope<T> Success(T data) => new(true, data, null);
 
-    public static ResultEnvelope<T> Failure(string code, string message, JsonObject? details = null) =>
+    public static ResultEnvelope<T> Failure(string code, string message, JsonElement? details = null) =>
         new(false, default, new ErrorInfo(code, message, details));
+
+    public T GetRequiredDataOrThrow(string operationName)
+    {
+        if (!Ok)
+            throw new InvalidOperationException($"{operationName} failed: {Error?.Message ?? "unknown error"}");
+
+        if (Data is null)
+            throw new InvalidOperationException($"{operationName} returned no data.");
+
+        return Data;
+    }
 }

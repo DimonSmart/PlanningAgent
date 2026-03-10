@@ -1,27 +1,26 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
-using PlanningAgentDemo.Agents;
+using PlanningAgentDemo.Common;
 
 namespace PlanningAgentDemo.Tests;
 
 public sealed class CachedLlmAnswerAsserter(IChatClient chatClient, string modelName)
 {
-    private const string PromptVersion = "v5";
+    private const string PromptVersion = "v7";
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private readonly string _cacheDirectory = Path.Combine(FindRepositoryRoot(), ".llm-test-cache", "answer-assertions");
 
     public async Task<AnswerAssertionVerdict> EvaluateAsync(
         string question,
-        JsonNode? answer,
+        JsonElement? answer,
         CancellationToken cancellationToken = default)
     {
         Directory.CreateDirectory(_cacheDirectory);
 
-        var answerJson = answer?.ToJsonString(JsonOptions) ?? "null";
+        var answerJson = answer is null ? "null" : JsonSerializer.Serialize(answer.Value, JsonOptions);
         var cacheKey = ComputeCacheKey(question, answerJson);
         var cachePath = Path.Combine(_cacheDirectory, $"{cacheKey}.json");
         if (File.Exists(cachePath))
@@ -33,8 +32,10 @@ public sealed class CachedLlmAnswerAsserter(IChatClient chatClient, string model
 
         var agent = new ChatClientAgent(chatClient, BuildSystemPrompt(), "answer_asserter", null, null, null, null);
         var userPrompt = BuildUserPrompt(question, answerJson);
-        var response = await agent.RunAsync(userPrompt, cancellationToken: cancellationToken);
-        var verdict = JsonResponseParser.ParseTypedFromLlm<AnswerAssertionVerdict>(response.Text) with { FromCache = false };
+        var response = await agent.RunAsync<ResultEnvelope<AnswerAssertionVerdict>>(userPrompt, cancellationToken: cancellationToken);
+        var envelope = response.Result
+            ?? throw new InvalidOperationException("Answer asserter returned an empty response envelope.");
+        var verdict = envelope.GetRequiredDataOrThrow("Answer asserter") with { FromCache = false };
         if (!verdict.IsAnswer && LooksLikeComparisonRecommendation(question, answer))
         {
             verdict = verdict with
@@ -70,11 +71,12 @@ public sealed class CachedLlmAnswerAsserter(IChatClient chatClient, string model
         You are a strict integration-test evaluator.
         Determine whether the candidate answer genuinely answers the original user question.
         Return ONLY valid JSON with this exact shape:
-        {"isAnswer":true|false,"comment":"short explanation"}
+        {"ok":true|false,"data":{"isAnswer":true|false,"comment":"short explanation"}|null,"error":null|{"code":"string","message":"string","details":null}}
         Mark isAnswer=true when the answer directly addresses the core request, even if wording differs or some intermediate context is omitted.
         If the question asks to compare or choose and the candidate gives a clear recommendation with a relevant justification, that usually counts as an answer.
         Judge the final user-visible deliverable, not whether every intermediate search or extraction result is restated.
         Mark isAnswer=false only when the answer is off-topic, materially incomplete, or does not answer what was asked.
+        When evaluation succeeds, set ok=true, error=null, and put the verdict into data.
         """;
 
     private static string BuildUserPrompt(string question, string answerJson) =>
@@ -94,17 +96,19 @@ public sealed class CachedLlmAnswerAsserter(IChatClient chatClient, string model
         throw new InvalidOperationException("Could not locate repository root for LLM test cache.");
     }
 
-    private static bool LooksLikeComparisonRecommendation(string question, JsonNode? answer)
+    private static bool LooksLikeComparisonRecommendation(string question, JsonElement? answer)
     {
         if (!IsComparisonQuestion(question))
             return false;
 
-        return answer switch
-        {
-            JsonObject answerObject => answerObject.Any(property => property.Key is "betterModel" or "better_model" or "recommendedModel" or "recommended_model" or "bestModel" or "preferredModel"),
-            JsonValue answerValue when answerValue.TryGetValue<string>(out var answerText) => LooksLikeComparisonRecommendationText(answerText),
-            _ => false
-        };
+        if (answer is not JsonElement answerElement)
+            return false;
+
+        if (answerElement.ValueKind == JsonValueKind.Object)
+            return answerElement.EnumerateObject().Any(property => property.Name is "betterModel" or "better_model" or "recommendedModel" or "recommended_model" or "bestModel" or "preferredModel");
+
+        return answerElement.ValueKind == JsonValueKind.String
+            && LooksLikeComparisonRecommendationText(answerElement.GetString() ?? string.Empty);
     }
 
     private static bool IsComparisonQuestion(string question)

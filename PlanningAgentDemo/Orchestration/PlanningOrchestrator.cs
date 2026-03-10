@@ -1,4 +1,4 @@
-using System.Text.Json.Nodes;
+using System.Text.Json;
 using PlanningAgentDemo.Common;
 using PlanningAgentDemo.Execution;
 using PlanningAgentDemo.Planning;
@@ -19,7 +19,7 @@ public sealed class PlanningOrchestrator(
     private readonly int _maxAttempts = maxAttempts;
     private readonly IReplanner? _replanner = replanner;
 
-    public async Task<ResultEnvelope<JsonNode?>> RunAsync(
+    public async Task<ResultEnvelope<JsonElement?>> RunAsync(
         string userQuery,
         CancellationToken cancellationToken = default)
     {
@@ -40,26 +40,26 @@ public sealed class PlanningOrchestrator(
             _log.Log($"[verify] goal:action={verdict.Action} reason={verdict.Reason}");
 
             if (verdict.Action == GoalAction.Done)
-                return ResultEnvelope<JsonNode?>.Success(plan.Steps[^1].Result?.DeepClone());
+                return ResultEnvelope<JsonElement?>.Success(plan.Steps[^1].Result?.Clone());
 
             if (verdict.Action == GoalAction.AskUser)
             {
-                return ResultEnvelope<JsonNode?>.Failure(
+                return ResultEnvelope<JsonElement?>.Failure(
                     "ask_user",
                     verdict.Reason,
-                    new JsonObject { ["question"] = verdict.UserQuestion });
+                    JsonSerializer.SerializeToElement(new { question = verdict.UserQuestion }));
             }
 
             if (attempt == _maxAttempts || _replanner is null)
             {
-                return ResultEnvelope<JsonNode?>.Failure(
+                return ResultEnvelope<JsonElement?>.Failure(
                     result.LastEnvelope?.Error?.Code ?? "goal_not_achieved",
                     verdict.Reason,
-                    new JsonObject
+                    JsonSerializer.SerializeToElement(new
                     {
-                        ["missing"] = new JsonArray(verdict.Missing.Select(missingItem => JsonValue.Create(missingItem)).ToArray()),
-                        ["attempt"] = attempt
-                    });
+                        missing = verdict.Missing,
+                        attempt
+                    }));
             }
 
             replanRequest = new PlannerReplanRequest
@@ -72,7 +72,7 @@ public sealed class PlanningOrchestrator(
             };
         }
 
-        return ResultEnvelope<JsonNode?>.Failure("goal_not_achieved", "Plan execution exceeded max attempts.");
+        return ResultEnvelope<JsonElement?>.Failure("goal_not_achieved", "Plan execution exceeded max attempts.");
     }
 
     private async Task<PlanDefinition> CreateReplanAsync(PlannerReplanRequest request, CancellationToken cancellationToken)

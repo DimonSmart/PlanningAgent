@@ -1,4 +1,4 @@
-using System.Text.Json.Nodes;
+using System.Text.Json;
 using PlanningAgentDemo.Common;
 
 namespace PlanningAgentDemo.Execution;
@@ -15,9 +15,9 @@ public sealed record StepExecutionTrace
 
     public string? ErrorMessage { get; init; }
 
-    public JsonObject? ErrorDetails { get; init; }
+    public JsonElement? ErrorDetails { get; init; }
 
-    public List<JsonObject> Calls { get; init; } = new();
+    public List<JsonElement> Calls { get; init; } = new();
 
     public List<StepVerificationIssue> VerificationIssues { get; init; } = [];
 }
@@ -37,5 +37,5 @@ public sealed class ExecutionResult
 
     public bool HasVerificationIssues => StepTraces.Any(x => x.VerificationIssues.Count > 0);
 
-    public ResultEnvelope<JsonNode?>? LastEnvelope { get; init; }
+    public ResultEnvelope<JsonElement?>? LastEnvelope { get; init; }
 }

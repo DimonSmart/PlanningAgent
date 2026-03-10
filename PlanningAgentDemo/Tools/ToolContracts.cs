@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using PlanningAgentDemo.Common;
 
@@ -23,7 +24,7 @@ public interface ITool
 
     ToolPlannerMetadata PlannerMetadata { get; }
 
-    Task<ResultEnvelope<JsonNode?>> ExecuteAsync(JsonObject input, CancellationToken cancellationToken = default);
+    Task<ResultEnvelope<JsonElement?>> ExecuteAsync(JsonElement input, CancellationToken cancellationToken = default);
 }
 
 public interface IToolRegistry

@@ -88,9 +88,10 @@ public sealed class LlmReplanner(
         {
             try
             {
-                var response = await agent.RunAsync<ReplanActionBatch>(currentPrompt, null, JsonOptions, null, cancellationToken);
-                var actionBatch = response.Result
-                    ?? throw new InvalidOperationException("Replanner returned an empty action batch payload.");
+                var response = await agent.RunAsync<ResultEnvelope<ReplanActionBatch>>(currentPrompt, null, JsonOptions, null, cancellationToken);
+                var envelope = response.Result
+                    ?? throw new InvalidOperationException("Replanner returned an empty response envelope.");
+                var actionBatch = envelope.GetRequiredDataOrThrow("Replanner");
                 ValidateActionBatch(actionBatch);
                 return actionBatch;
             }
@@ -132,7 +133,21 @@ public sealed class LlmReplanner(
         sb.AppendLine("You repair the working plan by calling plan-editing tools.");
         sb.AppendLine("Return ONLY JSON. No markdown. No prose outside the JSON.");
         sb.AppendLine();
-        sb.AppendLine("Your response must have this exact shape:");
+        sb.AppendLine("Your response must use this exact top-level shape:");
+        sb.AppendLine("{");
+        sb.AppendLine("  \"ok\": true|false,");
+        sb.AppendLine("  \"data\": <action-batch|null>,");
+        sb.AppendLine("  \"error\": null|{");
+        sb.AppendLine("    \"code\": \"string\",");
+        sb.AppendLine("    \"message\": \"string\",");
+        sb.AppendLine("    \"details\": { }|null");
+        sb.AppendLine("  }");
+        sb.AppendLine("}");
+        sb.AppendLine();
+        sb.AppendLine("When replanning succeeds, return ok=true, error=null, and put the action batch into data.");
+        sb.AppendLine("When replanning fails, return ok=false, data=null, and put the failure reason into error.");
+        sb.AppendLine();
+        sb.AppendLine("The action batch inside data must have this exact shape:");
         sb.AppendLine("{");
         sb.AppendLine("  \"done\": true|false,");
         sb.AppendLine("  \"reason\": \"short explanation\",");
@@ -197,7 +212,7 @@ public sealed class LlmReplanner(
     }
 
     private static string BuildRepairPrompt(string originalPrompt, string errorMessage) =>
-        $"{originalPrompt}\n\nYour previous response was invalid.\nValidation error: {errorMessage}\n\nReturn a corrected action batch as JSON only and follow the exact schema.";
+        $"{originalPrompt}\n\nYour previous response was invalid.\nValidation error: {errorMessage}\n\nReturn a corrected ResultEnvelope<ReplanActionBatch> as JSON only and follow the exact schema.";
 
     private static JsonArray ExecuteActions(
         PlanEditingSession session,
@@ -270,26 +285,41 @@ public sealed class LlmReplanner(
     {
         var missingFacts = new HashSet<string>(StringComparer.Ordinal);
         var observedEvidence = new HashSet<string>(StringComparer.Ordinal);
-        if (failedTrace.ErrorDetails?["errors"] is JsonArray errors)
+        JsonElement? status = null;
+        JsonElement? needsReplan = null;
+
+        if (failedTrace.ErrorDetails is { ValueKind: JsonValueKind.Object } errorDetails)
         {
-            foreach (var errorNode in errors.OfType<JsonObject>())
+            if (errorDetails.TryGetProperty("status", out var statusElement))
+                status = statusElement.Clone();
+
+            if (errorDetails.TryGetProperty("needsReplan", out var needsReplanElement))
+                needsReplan = needsReplanElement.Clone();
+
+            if (errorDetails.TryGetProperty("missingFacts", out var facts) && facts.ValueKind == JsonValueKind.Array)
             {
-                if (errorNode["details"] is not JsonObject details)
-                    continue;
-
-                if (details["missingFacts"] is JsonArray facts)
+                foreach (var factNode in facts.EnumerateArray())
                 {
-                    foreach (var factNode in facts)
-                    {
-                        var fact = factNode?.GetValue<string>()?.Trim();
-                        if (!string.IsNullOrWhiteSpace(fact))
-                            missingFacts.Add(fact);
-                    }
-                }
+                    if (factNode.ValueKind != JsonValueKind.String)
+                        continue;
 
-                var evidence = details["observedEvidence"]?.GetValue<string>()?.Trim();
-                if (!string.IsNullOrWhiteSpace(evidence))
-                    observedEvidence.Add(evidence);
+                    var fact = factNode.GetString()?.Trim();
+                    if (!string.IsNullOrWhiteSpace(fact))
+                        missingFacts.Add(fact);
+                }
+            }
+
+            if (errorDetails.TryGetProperty("observedEvidence", out var evidenceItems) && evidenceItems.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var evidenceNode in evidenceItems.EnumerateArray())
+                {
+                    if (evidenceNode.ValueKind != JsonValueKind.String)
+                        continue;
+
+                    var evidence = evidenceNode.GetString()?.Trim();
+                    if (!string.IsNullOrWhiteSpace(evidence))
+                        observedEvidence.Add(evidence);
+                }
             }
         }
 
@@ -298,8 +328,8 @@ public sealed class LlmReplanner(
             ["stepId"] = failedTrace.StepId,
             ["errorCode"] = failedTrace.ErrorCode,
             ["errorMessage"] = failedTrace.ErrorMessage,
-            ["status"] = failedTrace.ErrorDetails?["status"]?.DeepClone(),
-            ["needsReplan"] = failedTrace.ErrorDetails?["needsReplan"]?.DeepClone(),
+            ["status"] = SerializeElementToNode(status),
+            ["needsReplan"] = SerializeElementToNode(needsReplan),
             ["missingFacts"] = new JsonArray(missingFacts.Select(fact => JsonValue.Create(fact)).ToArray()),
             ["observedEvidence"] = new JsonArray(observedEvidence.Select(evidence => JsonValue.Create(evidence)).ToArray())
         };
@@ -315,6 +345,9 @@ public sealed class LlmReplanner(
             ["message"] = message
         }
     };
+
+    private static JsonNode? SerializeElementToNode(JsonElement? element) =>
+        element is null ? null : JsonSerializer.SerializeToNode(element.Value);
 
     private static string Shorten(string? value, int maxLength)
     {

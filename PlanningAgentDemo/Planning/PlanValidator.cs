@@ -39,8 +39,13 @@ public static partial class PlanValidator
             if (step.In.Count == 0)
                 throw new InvalidOperationException($"Step '{step.Id}' must declare its inputs in 'in'.");
 
-            if (hasTool && knownTools is not null && !knownTools.ContainsKey(step.Tool!))
-                throw new InvalidOperationException($"Step '{step.Id}' references unknown tool '{step.Tool}'.");
+            if (hasTool && knownTools is not null)
+            {
+                if (!knownTools.TryGetValue(step.Tool!, out var toolMetadata))
+                    throw new InvalidOperationException($"Step '{step.Id}' references unknown tool '{step.Tool}'.");
+
+                ValidateToolInputs(step, toolMetadata);
+            }
 
             if (hasLlm)
             {
@@ -58,6 +63,24 @@ public static partial class PlanValidator
             foreach (var input in step.In)
             {
                 ValidateRefOrThrow(step.Id, input.Key, input.Value, seenIds);
+            }
+        }
+    }
+
+    private static void ValidateToolInputs(PlanStep step, ToolPlannerMetadata toolMetadata)
+    {
+        if (!toolMetadata.InputSchema.TryGetPropertyValue("properties", out var propertiesNode) || propertiesNode is not JsonObject properties)
+        {
+            throw new InvalidOperationException(
+                $"Tool '{toolMetadata.Name}' has invalid planner metadata. Input schema must define an object 'properties' map.");
+        }
+
+        foreach (var inputName in step.In.Keys)
+        {
+            if (!properties.ContainsKey(inputName))
+            {
+                throw new InvalidOperationException(
+                    $"Tool step '{step.Id}' passes unknown input '{inputName}' to tool '{toolMetadata.Name}'.");
             }
         }
     }

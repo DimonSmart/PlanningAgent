@@ -1,6 +1,4 @@
 using System.Text.Json;
-using System.Text.Json.Nodes;
-using System.Text.Json.Serialization.Metadata;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 using PlanningAgentDemo.Common;
@@ -10,169 +8,160 @@ namespace PlanningAgentDemo.Agents;
 
 public interface IAgentStepRunner
 {
-    Task<ResultEnvelope<JsonNode?>> ExecuteAsync(
+    Task<ResultEnvelope<JsonElement?>> ExecuteAsync(
         PlanStep step,
-        JsonObject resolvedInputs,
+        JsonElement resolvedInputs,
         CancellationToken cancellationToken = default);
 }
 
 /// <summary>
 /// Executes an agent step by calling the LLM with the prompts embedded in the plan step.
-/// There is no agent registry — the planner decides system/user prompts when it creates the plan.
+/// There is no agent registry - the planner decides system/user prompts when it creates the plan.
 /// </summary>
 public sealed class AgentStepRunner(IChatClient chatClient) : IAgentStepRunner
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
-        PropertyNameCaseInsensitive = true,
-        TypeInfoResolver = new DefaultJsonTypeInfoResolver()
+        PropertyNameCaseInsensitive = true
     };
 
-    public async Task<ResultEnvelope<JsonNode?>> ExecuteAsync(
+    private static readonly JsonSerializerOptions PromptJsonOptions = new()
+    {
+        WriteIndented = true
+    };
+
+    public async Task<ResultEnvelope<JsonElement?>> ExecuteAsync(
         PlanStep step,
-        JsonObject resolvedInputs,
+        JsonElement resolvedInputs,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(step.Llm))
-            return ResultEnvelope<JsonNode?>.Failure("llm_missing", $"Step '{step.Id}' has no llm label.");
+            return ResultEnvelope<JsonElement?>.Failure("llm_missing", $"Step '{step.Id}' has no llm label.");
+        if (string.IsNullOrWhiteSpace(step.SystemPrompt))
+            return ResultEnvelope<JsonElement?>.Failure("llm_invalid_step", $"Step '{step.Id}' has no systemPrompt.");
+        if (string.IsNullOrWhiteSpace(step.UserPrompt))
+            return ResultEnvelope<JsonElement?>.Failure("llm_invalid_step", $"Step '{step.Id}' has no userPrompt.");
 
-        var systemPrompt = step.SystemPrompt ?? "You are a helpful assistant. Follow the user instruction carefully.";
-        // Enforce JSON output at the system-prompt level so the LLM always returns parseable JSON.
-        if (step.Out == "json" && !systemPrompt.Contains("JSON", StringComparison.OrdinalIgnoreCase))
-            systemPrompt += " Output ONLY valid JSON. No explanation, no markdown, no code fences.";
+        var systemPrompt = step.SystemPrompt;
+        if (!systemPrompt.Contains("JSON", StringComparison.OrdinalIgnoreCase))
+            systemPrompt += " Return ONLY valid JSON.";
         systemPrompt += BuildExecutionContract(step.Out);
-        var userInstruction = step.UserPrompt ?? "Process the input and return the result.";
 
-        var payload = new JsonObject { ["inputs"] = resolvedInputs };
-        var fullUserPrompt = $"{userInstruction}\n\nInput:\n{payload.ToJsonString(new JsonSerializerOptions { WriteIndented = true })}";
+        var fullUserPrompt = $"{step.UserPrompt}\n\nInput:\n{JsonSerializer.Serialize(new { inputs = resolvedInputs }, PromptJsonOptions)}";
         var agent = new ChatClientAgent(chatClient, systemPrompt, step.Llm, null, null, null, null);
 
         try
         {
-            if (string.Equals(step.Out, "string", StringComparison.OrdinalIgnoreCase))
-            {
-                var rawResponse = await agent.RunAsync(fullUserPrompt, null, null, cancellationToken);
-                var raw = rawResponse.Text.Trim();
+            var response = await agent.RunAsync<ResultEnvelope<JsonElement?>>(fullUserPrompt, null, JsonOptions, null, cancellationToken);
+            var envelope = response.Result
+                ?? throw new InvalidOperationException($"Step '{step.Id}' returned an empty response envelope.");
 
-                if (TryParseExecutionIssue(raw, step.Out, out var issueEnvelope))
-                    return issueEnvelope;
-
-                return ResultEnvelope<JsonNode?>.Success(JsonValue.Create(raw.Trim()));
-            }
-
-            var jsonResponse = await agent.RunAsync<JsonNode?>(fullUserPrompt, null, JsonOptions, null, cancellationToken);
-            var node = jsonResponse.Result?.DeepClone();
-
-            if (TryParseExecutionIssue(node, step.Out, out var jsonIssueEnvelope))
-                return jsonIssueEnvelope;
-
-            return ResultEnvelope<JsonNode?>.Success(node);
+            return ValidateEnvelope(step, envelope);
         }
         catch (Exception ex)
         {
-            return ResultEnvelope<JsonNode?>.Failure("llm_error", ex.Message);
+            return ResultEnvelope<JsonElement?>.Failure("llm_error", ex.Message);
         }
     }
 
     private static string BuildExecutionContract(string? outputType)
     {
         var resultHint = string.Equals(outputType, "string", StringComparison.OrdinalIgnoreCase)
-            ? "a plain string when successful"
-            : "the requested JSON payload when successful";
+            ? "a JSON string value"
+            : "the requested JSON value";
 
-        return $"\n\nIf the task cannot be completed reliably from the provided input, return valid JSON instead of guessing. Use this exact top-level shape: {{\"_execution\":{{\"status\":\"blocked\"|\"partial\",\"needsReplan\":true,\"errors\":[{{\"code\":\"short_code\",\"message\":\"human readable message\",\"details\":{{\"missingFacts\":[\"fact_name\"],\"observedEvidence\":\"short quote or summary\"}}}}]}},\"result\":null}}. Use status='blocked' when the requested entity or critical facts are absent. Use status='partial' when some useful facts are present but the full task still needs replanning. If you have a partial but still useful result, put it into 'result'. If you can complete the task reliably, return {resultHint}.";
+        return $"\n\nAlways return ONLY valid JSON using this exact top-level shape: {{\"ok\":true|false,\"data\":{resultHint}|null,\"error\":null|{{\"code\":\"short_code\",\"message\":\"human readable message\",\"details\":{{\"status\":\"blocked|partial\",\"needsReplan\":true,\"missingFacts\":[\"fact_name\"],\"observedEvidence\":[\"short quote or summary\"]}}}}}}. If the task can be completed reliably, return ok=true, error=null, and put the full answer into data. If reliable completion is impossible, return ok=false, data=null, and fill error. Use status='blocked' when the requested entity or critical facts are absent. Use status='partial' when some useful context exists but the task is still incomplete. When ok=false, needsReplan must be true. missingFacts must list the missing critical facts. observedEvidence must list short factual snippets from the input that explain the failure. Do not return markdown or prose outside the JSON envelope.";
     }
 
-    private static bool TryParseExecutionIssue(string raw, string? outputType, out ResultEnvelope<JsonNode?> envelope)
+    private static ResultEnvelope<JsonElement?> ValidateEnvelope(PlanStep step, ResultEnvelope<JsonElement?> envelope)
     {
-        envelope = default!;
+        if (envelope.Ok)
+        {
+            if (envelope.Error is not null)
+            {
+                return ResultEnvelope<JsonElement?>.Failure(
+                    "llm_invalid_contract",
+                    $"Step '{step.Id}' returned ok=true with a non-null error payload.");
+            }
 
-        JsonObject? root;
+            if (envelope.Data is null)
+            {
+                return ResultEnvelope<JsonElement?>.Failure(
+                    "llm_invalid_contract",
+                    $"Step '{step.Id}' returned ok=true with null data.");
+            }
+
+            if (string.Equals(step.Out, "string", StringComparison.OrdinalIgnoreCase))
+            {
+                if (envelope.Data is not { ValueKind: JsonValueKind.String } stringResult)
+                {
+                    return ResultEnvelope<JsonElement?>.Failure(
+                        "llm_invalid_contract",
+                        $"Step '{step.Id}' expected string data in the response envelope.");
+                }
+
+                return ResultEnvelope<JsonElement?>.Success(stringResult.Clone());
+            }
+
+            return ResultEnvelope<JsonElement?>.Success(envelope.Data.Value.Clone());
+        }
+
+        if (envelope.Error is null)
+        {
+            return ResultEnvelope<JsonElement?>.Failure(
+                "llm_invalid_contract",
+                $"Step '{step.Id}' returned ok=false without an error payload.");
+        }
+
+        if (string.IsNullOrWhiteSpace(envelope.Error.Message))
+        {
+            return ResultEnvelope<JsonElement?>.Failure(
+                "llm_invalid_contract",
+                $"Step '{step.Id}' returned ok=false with an empty error message.");
+        }
+
         try
         {
-            root = JsonResponseParser.ParseNodeFromLlm(raw) as JsonObject;
+            var validatedDetails = ValidateFailureDetails(step.Id, envelope.Error.Details);
+            var errorCode = string.IsNullOrWhiteSpace(envelope.Error.Code) ? "llm_failed" : envelope.Error.Code.Trim();
+            return ResultEnvelope<JsonElement?>.Failure(errorCode, envelope.Error.Message.Trim(), validatedDetails);
         }
-        catch
+        catch (Exception ex)
         {
-            return false;
+            return ResultEnvelope<JsonElement?>.Failure("llm_invalid_contract", ex.Message);
         }
-
-        if (root is null || root["_execution"] is not JsonObject execution)
-            return false;
-
-        var status = execution["status"]?.GetValue<string>() ?? "blocked";
-        var needsReplan = execution["needsReplan"]?.GetValue<bool>() ?? false;
-        var errors = execution["errors"] as JsonArray;
-        var hasErrors = errors is { Count: > 0 };
-
-        if (!needsReplan && !hasErrors && string.Equals(status, "ok", StringComparison.OrdinalIgnoreCase))
-        {
-            var resultNode = root["result"]?.DeepClone();
-            envelope = ResultEnvelope<JsonNode?>.Success(NormalizeWrappedResult(resultNode, outputType));
-            return true;
-        }
-
-        var message = hasErrors
-            ? string.Join("; ", errors!.Select(error => error?["message"]?.GetValue<string>() ?? "unknown issue"))
-            : $"LLM reported status '{status}'.";
-
-        envelope = ResultEnvelope<JsonNode?>.Failure(
-            "llm_reported_issue",
-            message,
-            new JsonObject
-            {
-                ["status"] = status,
-                ["needsReplan"] = needsReplan,
-                ["errors"] = errors?.DeepClone(),
-                ["result"] = root["result"]?.DeepClone()
-            });
-        return true;
     }
 
-    private static bool TryParseExecutionIssue(JsonNode? node, string? outputType, out ResultEnvelope<JsonNode?> envelope)
+    private static JsonElement ValidateFailureDetails(string stepId, JsonElement? details)
     {
-        envelope = default!;
+        var typedDetails = details?.Deserialize<LlmFailureDetails>(JsonOptions)
+            ?? throw new InvalidOperationException($"Step '{stepId}' returned ok=false without valid error.details.");
 
-        if (node is not JsonObject root || root["_execution"] is not JsonObject execution)
-            return false;
+        if (string.IsNullOrWhiteSpace(typedDetails.Status))
+            throw new InvalidOperationException($"Step '{stepId}' returned error.details without status.");
 
-        var status = execution["status"]?.GetValue<string>() ?? "blocked";
-        var needsReplan = execution["needsReplan"]?.GetValue<bool>() ?? false;
-        var errors = execution["errors"] as JsonArray;
-        var hasErrors = errors is { Count: > 0 };
-
-        if (!needsReplan && !hasErrors && string.Equals(status, "ok", StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(typedDetails.Status, "blocked", StringComparison.Ordinal)
+            && !string.Equals(typedDetails.Status, "partial", StringComparison.Ordinal))
         {
-            var resultNode = root["result"]?.DeepClone();
-            envelope = ResultEnvelope<JsonNode?>.Success(NormalizeWrappedResult(resultNode, outputType));
-            return true;
+            throw new InvalidOperationException(
+                $"Step '{stepId}' returned error.details.status='{typedDetails.Status}', but only 'blocked' or 'partial' are allowed.");
         }
 
-        var message = hasErrors
-            ? string.Join("; ", errors!.Select(error => error?["message"]?.GetValue<string>() ?? "unknown issue"))
-            : $"LLM reported status '{status}'.";
+        if (!typedDetails.NeedsReplan)
+        {
+            throw new InvalidOperationException(
+                $"Step '{stepId}' returned ok=false with error.details.needsReplan=false.");
+        }
 
-        envelope = ResultEnvelope<JsonNode?>.Failure(
-            "llm_reported_issue",
-            message,
-            new JsonObject
-            {
-                ["status"] = status,
-                ["needsReplan"] = needsReplan,
-                ["errors"] = errors?.DeepClone(),
-                ["result"] = root["result"]?.DeepClone()
-            });
-        return true;
-    }
+        if (typedDetails.MissingFacts is null)
+            throw new InvalidOperationException($"Step '{stepId}' returned error.details without missingFacts.");
+        if (typedDetails.ObservedEvidence is null)
+            throw new InvalidOperationException($"Step '{stepId}' returned error.details without observedEvidence.");
+        if (typedDetails.MissingFacts.Any(string.IsNullOrWhiteSpace))
+            throw new InvalidOperationException($"Step '{stepId}' returned error.details.missingFacts with blank items.");
+        if (typedDetails.ObservedEvidence.Any(string.IsNullOrWhiteSpace))
+            throw new InvalidOperationException($"Step '{stepId}' returned error.details.observedEvidence with blank items.");
 
-    private static JsonNode? NormalizeWrappedResult(JsonNode? resultNode, string? outputType)
-    {
-        if (!string.Equals(outputType, "string", StringComparison.OrdinalIgnoreCase))
-            return resultNode;
-
-        if (resultNode is JsonValue value && value.TryGetValue<string>(out var text))
-            return JsonValue.Create(text);
-
-        return JsonValue.Create(resultNode?.ToJsonString() ?? string.Empty);
+        return details.Value.Clone();
     }
 }

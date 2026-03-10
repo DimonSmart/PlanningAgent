@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 
@@ -72,7 +73,7 @@ public sealed class PlanStep
     public string Status { get; set; } = PlanStepStatuses.Todo;
 
     [JsonPropertyName("res")]
-    public JsonNode? Result { get; set; }
+    public JsonElement? Result { get; set; }
 
     [JsonPropertyName("err")]
     public PlanStepError? Error { get; set; }
@@ -87,5 +88,5 @@ public sealed class PlanStepError
     public string Message { get; init; } = string.Empty;
 
     [JsonPropertyName("details")]
-    public JsonObject? Details { get; init; }
+    public JsonElement? Details { get; init; }
 }

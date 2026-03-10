@@ -1,4 +1,4 @@
-using System.Text.Json.Nodes;
+using System.Text.Json;
 using PlanningAgentDemo.Execution;
 using PlanningAgentDemo.Planning;
 
@@ -46,7 +46,7 @@ public sealed class GoalVerifier(bool askUserEnabled = false)
         }
 
         var finalNode = finalStep.Result;
-        if (finalNode is JsonObject finalObj && finalObj.Count == 0)
+        if (finalNode.Value.ValueKind == JsonValueKind.Object && !finalNode.Value.EnumerateObject().Any())
         {
             return new GoalVerdict
             {
@@ -56,7 +56,7 @@ public sealed class GoalVerifier(bool askUserEnabled = false)
             };
         }
 
-        if (finalNode is JsonArray finalArray && finalArray.Count == 0)
+        if (finalNode.Value.ValueKind == JsonValueKind.Array && !finalNode.Value.EnumerateArray().Any())
         {
             return new GoalVerdict
             {
@@ -66,9 +66,8 @@ public sealed class GoalVerifier(bool askUserEnabled = false)
             };
         }
 
-        if (finalNode is JsonValue finalValue
-            && finalValue.TryGetValue<string>(out var finalText)
-            && string.IsNullOrWhiteSpace(finalText))
+        if (finalNode.Value.ValueKind == JsonValueKind.String
+            && string.IsNullOrWhiteSpace(finalNode.Value.GetString()))
         {
             return new GoalVerdict
             {
@@ -78,13 +77,19 @@ public sealed class GoalVerifier(bool askUserEnabled = false)
             };
         }
 
-        if (askUserEnabled && finalNode is JsonObject askUserObject && askUserObject["needUserInput"]?.GetValue<bool>() == true)
+        if (askUserEnabled
+            && finalNode.Value.ValueKind == JsonValueKind.Object
+            && finalNode.Value.TryGetProperty("needUserInput", out var needUserInput)
+            && needUserInput.ValueKind == JsonValueKind.True)
         {
             return new GoalVerdict
             {
                 Action = GoalAction.AskUser,
                 Reason = "Need clarification from user.",
-                UserQuestion = askUserObject["question"]?.GetValue<string>()
+                UserQuestion = finalNode.Value.TryGetProperty("question", out var question)
+                    && question.ValueKind == JsonValueKind.String
+                    ? question.GetString()
+                    : null
             };
         }
 
@@ -95,13 +100,23 @@ public sealed class GoalVerifier(bool askUserEnabled = false)
         };
     }
 
-    private static IReadOnlyCollection<string> ExtractVerificationIssues(string stepId, JsonObject? errorDetails)
+    private static IReadOnlyCollection<string> ExtractVerificationIssues(string stepId, JsonElement? errorDetails)
     {
-        if (errorDetails?["issues"] is not JsonArray issues)
+        if (errorDetails is not { ValueKind: JsonValueKind.Object } details
+            || !details.TryGetProperty("issues", out var issues)
+            || issues.ValueKind != JsonValueKind.Array)
+        {
             return [$"{stepId}:verification_failed"];
+        }
 
         return issues
-            .Select(issue => issue?["code"]?.GetValue<string>())
+            .EnumerateArray()
+            .Select(issue =>
+                issue.ValueKind == JsonValueKind.Object
+                && issue.TryGetProperty("code", out var code)
+                && code.ValueKind == JsonValueKind.String
+                    ? code.GetString()
+                    : null)
             .Where(code => !string.IsNullOrWhiteSpace(code))
             .Select(code => $"{stepId}:{code}")
             .ToList();

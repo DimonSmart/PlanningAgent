@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
+using PlanningAgentDemo.Common;
 using PlanningAgentDemo.Execution;
 using PlanningAgentDemo.Tools;
 
@@ -44,9 +45,10 @@ public sealed class LlmPlanner(
         {
             try
             {
-                var response = await agent.RunAsync<PlanDefinition>(planningPrompt, null, JsonOptions, null, cancellationToken);
-                var plan = response.Result
-                    ?? throw new InvalidOperationException("Planner returned an empty plan payload.");
+                var response = await agent.RunAsync<ResultEnvelope<PlanDefinition>>(planningPrompt, null, JsonOptions, null, cancellationToken);
+                var envelope = response.Result
+                    ?? throw new InvalidOperationException("Planner returned an empty response envelope.");
+                var plan = envelope.GetRequiredDataOrThrow("Planner");
                 PlanValidator.ValidateOrThrow(plan, tools);
 
                 _log.Log($"[plan] create:success steps={plan.Steps.Count} goal={Shorten(plan.Goal, 240)}");
@@ -75,7 +77,7 @@ public sealed class LlmPlanner(
     {
         var sb = new StringBuilder();
         sb.AppendLine("You are a planning agent. Given a user request, produce an execution plan.");
-        sb.AppendLine("Return a COMPLETE and VALID plan object on the first try.");
+        sb.AppendLine("Return a COMPLETE and VALID plan envelope on the first try.");
         sb.AppendLine("A plan is an ordered list of workflow steps. There are exactly two kinds of steps:");
         sb.AppendLine();
         sb.AppendLine("1. Tool steps: use field \"tool\": \"<name>\".");
@@ -84,7 +86,21 @@ public sealed class LlmPlanner(
         sb.AppendLine("   LLM steps have NO tool access and NO internet access.");
         sb.AppendLine("   They can only reason over outputs produced by earlier tool steps.");
         sb.AppendLine();
-        sb.AppendLine("Required JSON shape:");
+        sb.AppendLine("Required top-level JSON shape:");
+        sb.AppendLine("{");
+        sb.AppendLine("  \"ok\": true|false,");
+        sb.AppendLine("  \"data\": <plan|null>,");
+        sb.AppendLine("  \"error\": null|{");
+        sb.AppendLine("    \"code\": \"string\",");
+        sb.AppendLine("    \"message\": \"string\",");
+        sb.AppendLine("    \"details\": { }|null");
+        sb.AppendLine("  }");
+        sb.AppendLine("}");
+        sb.AppendLine();
+        sb.AppendLine("When planning succeeds, return ok=true, error=null, and put the complete plan into data.");
+        sb.AppendLine("When planning fails, return ok=false, data=null, and put the failure reason into error.");
+        sb.AppendLine();
+        sb.AppendLine("The plan inside data must use this exact JSON shape:");
         sb.AppendLine("{");
         sb.AppendLine("  \"goal\": \"string\",");
         sb.AppendLine("  \"steps\": [");
@@ -155,14 +171,14 @@ public sealed class LlmPlanner(
         sb.AppendLine("- Put step parameters under \"in\". Do not place tool args as top-level step properties.");
         sb.AppendLine("- Every step must include id, in, s, res, and err.");
         sb.AppendLine();
-        sb.AppendLine("Return only the plan object. No markdown fences. No prose outside the JSON.");
+        sb.AppendLine("Return only the JSON envelope. No markdown fences. No prose outside the JSON.");
         return sb.ToString();
     }
 
     private static string BuildPlanningUserPrompt(string userQuery) => userQuery;
 
     private static string BuildRepairPrompt(string originalUserPrompt, string errorMessage) =>
-        $"{originalUserPrompt}\n\nYour previous plan was invalid.\nValidation error: {errorMessage}\n\nReturn a corrected FULL plan as JSON only.\nNon-negotiable requirements:\n- Follow the exact PlanDefinition schema.\n- Each step must include id, in, s, res, and err.\n- A step must have exactly one of tool or llm.\n- Each llm step must include systemPrompt, userPrompt, and out.\n- Use the exact field names from the schema.\n- Put all step inputs under in.\n- Use only refs to earlier steps.\nDo not repeat the same mistake.";
+        $"{originalUserPrompt}\n\nYour previous plan was invalid.\nValidation error: {errorMessage}\n\nReturn a corrected ResultEnvelope<PlanDefinition> as JSON only.\nNon-negotiable requirements:\n- Follow the exact ok/data/error envelope schema.\n- Put the full plan inside data when ok=true.\n- Each step must include id, in, s, res, and err.\n- A step must have exactly one of tool or llm.\n- Each llm step must include systemPrompt, userPrompt, and out.\n- Use the exact field names from the schema.\n- Put all step inputs under in.\n- Use only refs to earlier steps.\nDo not repeat the same mistake.";
 
     private static string Shorten(string? value, int maxLength)
     {

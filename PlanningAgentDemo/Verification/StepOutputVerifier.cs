@@ -1,4 +1,4 @@
-using System.Text.Json.Nodes;
+using System.Text.Json;
 using PlanningAgentDemo.Execution;
 using PlanningAgentDemo.Planning;
 
@@ -6,11 +6,11 @@ namespace PlanningAgentDemo.Verification;
 
 public static class StepOutputVerifier
 {
-    public static List<StepVerificationIssue> Verify(PlanStep step, JsonNode? output)
+    public static List<StepVerificationIssue> Verify(PlanStep step, JsonElement? output)
     {
         var issues = new List<StepVerificationIssue>();
 
-        if (output is null)
+        if (output is null || output.Value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
         {
             issues.Add(new StepVerificationIssue
             {
@@ -20,9 +20,9 @@ public static class StepOutputVerifier
             return issues;
         }
 
-        switch (output)
+        switch (output.Value.ValueKind)
         {
-            case JsonValue value when value.TryGetValue<string>(out var text) && string.IsNullOrWhiteSpace(text):
+            case JsonValueKind.String when string.IsNullOrWhiteSpace(output.Value.GetString()):
                 issues.Add(new StepVerificationIssue
                 {
                     Code = "empty_string_output",
@@ -30,7 +30,7 @@ public static class StepOutputVerifier
                 });
                 return issues;
 
-            case JsonObject jsonObject when jsonObject.Count == 0:
+            case JsonValueKind.Object when !output.Value.EnumerateObject().Any():
                 issues.Add(new StepVerificationIssue
                 {
                     Code = "empty_object_output",
@@ -38,7 +38,7 @@ public static class StepOutputVerifier
                 });
                 return issues;
 
-            case JsonArray jsonArray when jsonArray.Count == 0:
+            case JsonValueKind.Array when !output.Value.EnumerateArray().Any():
                 issues.Add(new StepVerificationIssue
                 {
                     Code = "empty_array_output",
@@ -47,24 +47,30 @@ public static class StepOutputVerifier
                 return issues;
         }
 
-        if (output is JsonArray array)
+        if (output.Value.ValueKind == JsonValueKind.Array)
         {
-            for (var index = 0; index < array.Count; index++)
+            var index = 0;
+            foreach (var item in output.Value.EnumerateArray())
             {
-                if (!IsStructurallyEmpty(array[index]))
+                if (!IsStructurallyEmpty(item))
+                {
+                    index++;
                     continue;
+                }
 
                 issues.Add(new StepVerificationIssue
                 {
                     Code = "structurally_empty_array_item",
                     Message = $"Step '{step.Id}' produced a structurally empty item at index {index}."
                 });
+
+                index++;
             }
 
             return issues;
         }
 
-        if (IsStructurallyEmpty(output))
+        if (IsStructurallyEmpty(output.Value))
         {
             issues.Add(new StepVerificationIssue
             {
@@ -76,35 +82,31 @@ public static class StepOutputVerifier
         return issues;
     }
 
-    private static bool IsStructurallyEmpty(JsonNode? node)
+    private static bool IsStructurallyEmpty(JsonElement node)
     {
-        if (node is null)
-            return true;
-
-        if (node is JsonValue value)
+        switch (node.ValueKind)
         {
-            if (value.TryGetValue<string>(out var text))
-                return string.IsNullOrWhiteSpace(text);
-
-            return false;
-        }
-
-        if (node is JsonObject jsonObject)
-        {
-            if (jsonObject.Count == 0)
+            case JsonValueKind.Null:
+            case JsonValueKind.Undefined:
                 return true;
 
-            return jsonObject.All(property => IsStructurallyEmpty(property.Value));
+            case JsonValueKind.String:
+                return string.IsNullOrWhiteSpace(node.GetString());
+
+            case JsonValueKind.Object:
+                if (!node.EnumerateObject().Any())
+                    return true;
+
+                return node.EnumerateObject().All(property => IsStructurallyEmpty(property.Value));
+
+            case JsonValueKind.Array:
+                if (!node.EnumerateArray().Any())
+                    return true;
+
+                return node.EnumerateArray().All(IsStructurallyEmpty);
+
+            default:
+                return false;
         }
-
-        if (node is JsonArray jsonArray)
-        {
-            if (jsonArray.Count == 0)
-                return true;
-
-            return jsonArray.All(IsStructurallyEmpty);
-        }
-
-        return false;
     }
 }
