@@ -317,7 +317,8 @@ public class PipelineTests(ITestOutputHelper output)
         Assert.False(result.Ok);
         Assert.False(string.IsNullOrWhiteSpace(result.Error?.Code));
         Assert.Equal("blocked", GetStringProperty(result.Error?.Details, "status"));
-        Assert.True(PropertyIsArray(result.Error?.Details, "missingFacts"));
+        Assert.Equal("missing", GetStringProperty(result.Error?.Details, "type"));
+        Assert.True(PropertyIsArray(result.Error?.Details, "details"));
     }
 
     [Fact]
@@ -340,7 +341,8 @@ public class PipelineTests(ITestOutputHelper output)
         var trace = Assert.Single(replanner.ReplanRequests[0].ExecutionResult.StepTraces, step => !step.Success);
         Assert.False(string.IsNullOrWhiteSpace(trace.ErrorCode));
         Assert.Equal("blocked", GetStringProperty(trace.ErrorDetails, "status"));
-        Assert.True(PropertyIsArray(trace.ErrorDetails, "missingFacts"));
+        Assert.Equal("missing", GetStringProperty(trace.ErrorDetails, "type"));
+        Assert.True(PropertyIsArray(trace.ErrorDetails, "details"));
         var verdict = await answerAsserter.EvaluateAsync(userQuery, result.Data);
         output.WriteLine($"LLM asserter verdict: isAnswer={verdict.IsAnswer} cache={verdict.FromCache} comment={verdict.Comment}");
         Assert.True(verdict.IsAnswer, verdict.Comment);
@@ -385,8 +387,10 @@ public class PipelineTests(ITestOutputHelper output)
                 {
                     ["status"] = "blocked",
                     ["needsReplan"] = true,
-                    ["missingFacts"] = new JsonArray("docking_station_wattage"),
-                    ["observedEvidence"] = new JsonArray("Page contains suction, battery, dustbin, navigation, and price.")
+                    ["type"] = "missing",
+                    ["details"] = new JsonArray(
+                        "docking_station_wattage",
+                        "Page contains suction, battery, dustbin, navigation, and price.")
                 })),
             ResultEnvelope<JsonNode?>.Success(new JsonObject
             {
@@ -526,8 +530,10 @@ public class PipelineTests(ITestOutputHelper output)
                         {
                             ["status"] = "blocked",
                             ["needsReplan"] = true,
-                            ["missingFacts"] = new JsonArray("docking_station_wattage"),
-                            ["observedEvidence"] = new JsonArray("The downloaded page contains suction power and price only.")
+                            ["type"] = "missing",
+                            ["details"] = new JsonArray(
+                                "docking_station_wattage",
+                                "The downloaded page contains suction power and price only.")
                         })
                     }
                 ]
@@ -774,8 +780,11 @@ public class PipelineTests(ITestOutputHelper output)
             "details": {
               "status": "blocked",
               "needsReplan": true,
-              "missingFacts": ["required_input"],
-              "observedEvidence": ["The provided data is not enough."]
+              "type": "missing",
+              "details": [
+                "required_input",
+                "The provided data is not enough."
+              ]
             }
           }
         }
@@ -849,8 +858,11 @@ public class PipelineTests(ITestOutputHelper output)
                 "details": {
                   "status": "blocked",
                   "needsReplan": true,
-                  "missingFacts": ["required_input"],
-                  "observedEvidence": ["The provided data is not enough."]
+                  "type": "missing",
+                  "details": [
+                    "required_input",
+                    "The provided data is not enough."
+                  ]
                 }
               }
             }

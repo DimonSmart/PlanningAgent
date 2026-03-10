@@ -70,7 +70,7 @@ public sealed class AgentStepRunner(IChatClient chatClient) : IAgentStepRunner
             ? "a JSON string value"
             : "the requested JSON value";
 
-        return $"\n\nAlways return ONLY valid JSON using this exact top-level shape: {{\"ok\":true|false,\"data\":{resultHint}|null,\"error\":null|{{\"code\":\"short_code\",\"message\":\"human readable message\",\"details\":{{\"status\":\"blocked|partial\",\"needsReplan\":true,\"missingFacts\":[\"fact_name\"],\"observedEvidence\":[\"short quote or summary\"]}}}}}}. If the task can be completed reliably, return ok=true, error=null, and put the full answer into data. If reliable completion is impossible, return ok=false, data=null, and fill error. Use status='blocked' when the requested entity or critical facts are absent. Use status='partial' when some useful context exists but the task is still incomplete. When ok=false, needsReplan must be true. missingFacts must list the missing critical facts. observedEvidence must list short factual snippets from the input that explain the failure. Do not return markdown or prose outside the JSON envelope.";
+        return $"\n\nAlways return ONLY valid JSON using this exact top-level shape: {{\"ok\":true|false,\"data\":{resultHint}|null,\"error\":null|{{\"code\":\"short_code\",\"message\":\"human readable message\",\"details\":{{\"status\":\"blocked|partial\",\"needsReplan\":true,\"type\":\"missing|error\",\"details\":[\"short detail\"]}}}}}}. If the task can be completed reliably, return ok=true, error=null, and put the full answer into data. If reliable completion is impossible, return ok=false, data=null, and fill error. Use status='blocked' when the requested entity or critical facts are absent. Use status='partial' when some useful context exists but the task is still incomplete. When ok=false, needsReplan must be true. Use type='missing' when critical input facts are absent. Use type='error' when the step is blocked by another execution problem. Put short factual details into details, such as missing field names, observed evidence, or concrete failure notes. Do not return markdown or prose outside the JSON envelope.";
     }
 
     private static ResultEnvelope<JsonElement?> ValidateEnvelope(PlanStep step, ResultEnvelope<JsonElement?> envelope)
@@ -153,14 +153,17 @@ public sealed class AgentStepRunner(IChatClient chatClient) : IAgentStepRunner
                 $"Step '{stepId}' returned ok=false with error.details.needsReplan=false.");
         }
 
-        if (typedDetails.MissingFacts is null)
-            throw new InvalidOperationException($"Step '{stepId}' returned error.details without missingFacts.");
-        if (typedDetails.ObservedEvidence is null)
-            throw new InvalidOperationException($"Step '{stepId}' returned error.details without observedEvidence.");
-        if (typedDetails.MissingFacts.Any(string.IsNullOrWhiteSpace))
-            throw new InvalidOperationException($"Step '{stepId}' returned error.details.missingFacts with blank items.");
-        if (typedDetails.ObservedEvidence.Any(string.IsNullOrWhiteSpace))
-            throw new InvalidOperationException($"Step '{stepId}' returned error.details.observedEvidence with blank items.");
+        if (!string.Equals(typedDetails.Type, "missing", StringComparison.Ordinal)
+            && !string.Equals(typedDetails.Type, "error", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Step '{stepId}' returned error.details.type='{typedDetails.Type}', but only 'missing' or 'error' are allowed.");
+        }
+
+        if (typedDetails.Details is null)
+            throw new InvalidOperationException($"Step '{stepId}' returned error.details without details.");
+        if (typedDetails.Details.Any(string.IsNullOrWhiteSpace))
+            throw new InvalidOperationException($"Step '{stepId}' returned error.details.details with blank items.");
 
         return details.Value.Clone();
     }

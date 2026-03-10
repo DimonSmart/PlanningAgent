@@ -11,8 +11,8 @@ public sealed record ErrorInfo(
 public sealed record LlmFailureDetails(
     [property: JsonPropertyName("status")] string Status,
     [property: JsonPropertyName("needsReplan")] bool NeedsReplan,
-    [property: JsonPropertyName("missingFacts")] string[] MissingFacts,
-    [property: JsonPropertyName("observedEvidence")] string[] ObservedEvidence);
+    [property: JsonPropertyName("type")] string Type,
+    [property: JsonPropertyName("details")] string[] Details);
 
 public sealed record ResultEnvelope<T>(
     [property: JsonPropertyName("ok")] bool Ok,

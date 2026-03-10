@@ -163,7 +163,7 @@ public sealed class LlmReplanner(
         sb.AppendLine("- Reuse successful upstream steps whenever possible.");
         sb.AppendLine("- Do not repeat a failed extraction/comparison prompt unchanged when the failure data explains what was missing.");
         sb.AppendLine("- Use runtime.readFailedTrace(stepId) when you need the compact structured details of a failed step.");
-        sb.AppendLine("- If the failed trace identifies missingFacts and your edit removes that requirement or makes it optional, finish with done=true instead of iterating further.");
+        sb.AppendLine("- If the failed trace has type='missing' and your edit removes that requirement or makes it optional, finish with done=true instead of iterating further.");
         sb.AppendLine("- plan.resetFrom(stepId) resets execution state for that step and all downstream steps so the executor will rerun them.");
         sb.AppendLine("- plan.replaceStep(stepId, step) replaces exactly one existing step in place.");
         sb.AppendLine("- plan.addSteps(afterStepId, steps) inserts new steps after the specified step. Use afterStepId=null only when rebuilding from an empty draft.");
@@ -283,10 +283,10 @@ public sealed class LlmReplanner(
 
     private static JsonObject BuildFailedTraceSummary(StepExecutionTrace failedTrace)
     {
-        var missingFacts = new HashSet<string>(StringComparer.Ordinal);
-        var observedEvidence = new HashSet<string>(StringComparer.Ordinal);
         JsonElement? status = null;
         JsonElement? needsReplan = null;
+        JsonElement? type = null;
+        var details = new HashSet<string>(StringComparer.Ordinal);
 
         if (failedTrace.ErrorDetails is { ValueKind: JsonValueKind.Object } errorDetails)
         {
@@ -296,29 +296,19 @@ public sealed class LlmReplanner(
             if (errorDetails.TryGetProperty("needsReplan", out var needsReplanElement))
                 needsReplan = needsReplanElement.Clone();
 
-            if (errorDetails.TryGetProperty("missingFacts", out var facts) && facts.ValueKind == JsonValueKind.Array)
+            if (errorDetails.TryGetProperty("type", out var typeElement))
+                type = typeElement.Clone();
+
+            if (errorDetails.TryGetProperty("details", out var detailItems) && detailItems.ValueKind == JsonValueKind.Array)
             {
-                foreach (var factNode in facts.EnumerateArray())
+                foreach (var detailNode in detailItems.EnumerateArray())
                 {
-                    if (factNode.ValueKind != JsonValueKind.String)
+                    if (detailNode.ValueKind != JsonValueKind.String)
                         continue;
 
-                    var fact = factNode.GetString()?.Trim();
-                    if (!string.IsNullOrWhiteSpace(fact))
-                        missingFacts.Add(fact);
-                }
-            }
-
-            if (errorDetails.TryGetProperty("observedEvidence", out var evidenceItems) && evidenceItems.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var evidenceNode in evidenceItems.EnumerateArray())
-                {
-                    if (evidenceNode.ValueKind != JsonValueKind.String)
-                        continue;
-
-                    var evidence = evidenceNode.GetString()?.Trim();
-                    if (!string.IsNullOrWhiteSpace(evidence))
-                        observedEvidence.Add(evidence);
+                    var detail = detailNode.GetString()?.Trim();
+                    if (!string.IsNullOrWhiteSpace(detail))
+                        details.Add(detail);
                 }
             }
         }
@@ -330,8 +320,8 @@ public sealed class LlmReplanner(
             ["errorMessage"] = failedTrace.ErrorMessage,
             ["status"] = SerializeElementToNode(status),
             ["needsReplan"] = SerializeElementToNode(needsReplan),
-            ["missingFacts"] = new JsonArray(missingFacts.Select(fact => JsonValue.Create(fact)).ToArray()),
-            ["observedEvidence"] = new JsonArray(observedEvidence.Select(evidence => JsonValue.Create(evidence)).ToArray())
+            ["type"] = SerializeElementToNode(type),
+            ["details"] = new JsonArray(details.Select(detail => JsonValue.Create(detail)).ToArray())
         };
     }
 
