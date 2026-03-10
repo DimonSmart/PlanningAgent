@@ -53,6 +53,10 @@ public static partial class PlanValidator
                     throw new InvalidOperationException($"LLM step '{step.Id}' must provide systemPrompt.");
                 if (string.IsNullOrWhiteSpace(step.UserPrompt))
                     throw new InvalidOperationException($"LLM step '{step.Id}' must provide userPrompt.");
+                if (ContainsPromptRef(step.SystemPrompt!))
+                    throw new InvalidOperationException($"LLM step '{step.Id}' must not embed step refs inside systemPrompt.");
+                if (ContainsPromptRef(step.UserPrompt!))
+                    throw new InvalidOperationException($"LLM step '{step.Id}' must not embed step refs inside userPrompt.");
                 if (step.SystemPrompt!.Contains("{{", StringComparison.Ordinal) || step.UserPrompt!.Contains("{{", StringComparison.Ordinal))
                 {
                     throw new InvalidOperationException(
@@ -121,9 +125,15 @@ public static partial class PlanValidator
     [GeneratedRegex(@"^\$[A-Za-z_][A-Za-z0-9_-]*(?:\[\]|\[\d+\])?(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")]
     private static partial Regex RefPattern();
 
+    [GeneratedRegex(@"\$[A-Za-z_][A-Za-z0-9_-]*(?:\[\]|\[\d+\])?(?:\.[A-Za-z_][A-Za-z0-9_]*)?")]
+    private static partial Regex EmbeddedRefPattern();
+
     private static bool IsValidStatus(string? status) =>
         string.Equals(status, PlanStepStatuses.Todo, StringComparison.Ordinal)
         || string.Equals(status, PlanStepStatuses.Done, StringComparison.Ordinal)
         || string.Equals(status, PlanStepStatuses.Fail, StringComparison.Ordinal)
         || string.Equals(status, PlanStepStatuses.Skip, StringComparison.Ordinal);
+
+    private static bool ContainsPromptRef(string prompt) =>
+        EmbeddedRefPattern().IsMatch(prompt);
 }

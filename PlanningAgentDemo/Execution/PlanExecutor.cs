@@ -11,9 +11,11 @@ namespace PlanningAgentDemo.Execution;
 public sealed class PlanExecutor(
     IToolRegistry toolRegistry,
     IAgentStepRunner agentStepRunner,
-    IExecutionLogger? executionLogger = null)
+    IExecutionLogger? executionLogger = null,
+    IPlanRunObserver? planRunObserver = null)
 {
     private readonly IExecutionLogger _log = executionLogger ?? NullExecutionLogger.Instance;
+    private readonly IPlanRunObserver _observer = planRunObserver ?? NullPlanRunObserver.Instance;
 
     public async Task<ExecutionResult> ExecuteAsync(
         PlanDefinition plan,
@@ -28,6 +30,7 @@ public sealed class PlanExecutor(
             if (IsReusable(step))
             {
                 _log.Log($"[exec] step:reuse id={step.Id}");
+                _observer.OnEvent(new StepReusedEvent(step.Id));
                 traces.Add(new StepExecutionTrace
                 {
                     StepId = step.Id,
@@ -68,15 +71,30 @@ public sealed class PlanExecutor(
         var fanOutCount = fanOutInputs?.Values.FirstOrDefault()?.Length ?? 0;
 
         _log.Log($"[exec] step:start id={step.Id} kind={(isTool ? "tool" : "llm")} name={(isTool ? step.Tool : step.Llm)} fanOut={(fanOutInputs is null ? "no" : fanOutCount.ToString())} resolvedInputs={SerializeElement(resolvedInput)}");
+        _observer.OnEvent(new StepStartedEvent(
+            step.Id,
+            isTool ? "tool" : "llm",
+            isTool ? step.Tool! : step.Llm!,
+            resolvedInput.Clone(),
+            fanOutInputs is null ? null : fanOutCount));
 
         ResultEnvelope<JsonElement?> envelope;
         if (fanOutInputs is null)
         {
             _log.Log($"[exec] call:start step={step.Id} callIndex=0 input={SerializeElement(resolvedInput)}");
+            _observer.OnEvent(new StepCallStartedEvent(step.Id, 0, resolvedInput.Clone()));
             envelope = isTool
                 ? await RunToolAsync(step.Tool!, resolvedInput, calls, cancellationToken)
                 : await RunAgentAsync(step, resolvedInput, calls, cancellationToken);
             _log.Log($"[exec] call:end step={step.Id} callIndex=0 ok={envelope.Ok} output={SerializeElement(envelope.Data)} error={Shorten(envelope.Error?.Message, 240)} details={SerializeElement(envelope.Error?.Details)}");
+            _observer.OnEvent(new StepCallCompletedEvent(
+                step.Id,
+                0,
+                envelope.Ok,
+                CloneElement(envelope.Data),
+                envelope.Error is null
+                    ? null
+                    : new ErrorInfo(envelope.Error.Code, envelope.Error.Message, CloneElement(envelope.Error.Details))));
 
             if (envelope.Ok)
                 outputs.Add(CloneElement(envelope.Data));
@@ -88,10 +106,19 @@ public sealed class PlanExecutor(
             {
                 var singleInput = SubstituteScalars(resolved, fanOutInputs, callIndex);
                 _log.Log($"[exec] call:start step={step.Id} callIndex={callIndex} input={SerializeElement(singleInput)}");
+                _observer.OnEvent(new StepCallStartedEvent(step.Id, callIndex, singleInput.Clone()));
                 envelope = isTool
                     ? await RunToolAsync(step.Tool!, singleInput, calls, cancellationToken)
                     : await RunAgentAsync(step, singleInput, calls, cancellationToken);
                 _log.Log($"[exec] call:end step={step.Id} callIndex={callIndex} ok={envelope.Ok} output={SerializeElement(envelope.Data)} error={Shorten(envelope.Error?.Message, 240)} details={SerializeElement(envelope.Error?.Details)}");
+                _observer.OnEvent(new StepCallCompletedEvent(
+                    step.Id,
+                    callIndex,
+                    envelope.Ok,
+                    CloneElement(envelope.Data),
+                    envelope.Error is null
+                        ? null
+                        : new ErrorInfo(envelope.Error.Code, envelope.Error.Message, CloneElement(envelope.Error.Details))));
 
                 if (!envelope.Ok)
                     break;
@@ -112,7 +139,9 @@ public sealed class PlanExecutor(
             step.Status = PlanStepStatuses.Fail;
             step.Error = CreatePlanStepError(envelope.Error);
             _log.Log($"[exec] step:end id={step.Id} success=False calls={calls.Count} error={Shorten(step.Error?.Message, 240)} details={SerializeElement(step.Error?.Details)}");
-            return (CreateTrace(step, success: false, reused: false, calls, []), envelope);
+            var trace = CreateTrace(step, success: false, reused: false, calls, []);
+            _observer.OnEvent(new StepCompletedEvent(trace, CloneElement(step.Result)));
+            return (trace, envelope);
         }
 
         var verificationIssues = StepOutputVerifier.Verify(step, step.Result);
@@ -125,14 +154,18 @@ public sealed class PlanExecutor(
 
             envelope = ResultEnvelope<JsonElement?>.Failure(step.Error.Code, step.Error.Message, CloneElement(step.Error.Details));
             _log.Log($"[exec] step:end id={step.Id} success=False calls={calls.Count} error={Shorten(step.Error.Message, 240)} details={SerializeElement(step.Error.Details)}");
-            return (CreateTrace(step, success: false, reused: false, calls, verificationIssues), envelope);
+            var trace = CreateTrace(step, success: false, reused: false, calls, verificationIssues);
+            _observer.OnEvent(new StepCompletedEvent(trace, CloneElement(step.Result)));
+            return (trace, envelope);
         }
 
         step.Status = PlanStepStatuses.Done;
         step.Error = null;
         _log.Log($"[exec] step:stored id={step.Id} output={SerializeElement(step.Result)}");
         _log.Log($"[exec] step:end id={step.Id} success=True calls={calls.Count} error=<none> details=null");
-        return (CreateTrace(step, success: true, reused: false, calls, []), envelope);
+        var successTrace = CreateTrace(step, success: true, reused: false, calls, []);
+        _observer.OnEvent(new StepCompletedEvent(successTrace, CloneElement(step.Result)));
+        return (successTrace, envelope);
     }
 
     private async Task<ResultEnvelope<JsonElement?>> RunToolAsync(

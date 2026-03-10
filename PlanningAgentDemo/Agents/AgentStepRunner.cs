@@ -2,6 +2,7 @@ using System.Text.Json;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 using PlanningAgentDemo.Common;
+using PlanningAgentDemo.Execution;
 using PlanningAgentDemo.Planning;
 
 namespace PlanningAgentDemo.Agents;
@@ -30,6 +31,13 @@ public sealed class AgentStepRunner(IChatClient chatClient) : IAgentStepRunner
         WriteIndented = true
     };
 
+    private readonly IPlanRunObserver _observer = NullPlanRunObserver.Instance;
+
+    public AgentStepRunner(IChatClient chatClient, IPlanRunObserver? planRunObserver = null) : this(chatClient)
+    {
+        _observer = planRunObserver ?? NullPlanRunObserver.Instance;
+    }
+
     public async Task<ResultEnvelope<JsonElement?>> ExecuteAsync(
         PlanStep step,
         JsonElement resolvedInputs,
@@ -48,6 +56,13 @@ public sealed class AgentStepRunner(IChatClient chatClient) : IAgentStepRunner
         systemPrompt += BuildExecutionContract(step.Out);
 
         var fullUserPrompt = $"{step.UserPrompt}\n\nInput:\n{JsonSerializer.Serialize(new { inputs = resolvedInputs }, PromptJsonOptions)}";
+        _observer.OnEvent(new AgentPromptPreparedEvent(
+            step.Id,
+            step.Llm,
+            systemPrompt,
+            step.UserPrompt,
+            fullUserPrompt,
+            resolvedInputs.Clone()));
         var agent = new ChatClientAgent(chatClient, systemPrompt, step.Llm, null, null, null, null);
 
         try
@@ -55,11 +70,28 @@ public sealed class AgentStepRunner(IChatClient chatClient) : IAgentStepRunner
             var response = await agent.RunAsync<ResultEnvelope<JsonElement?>>(fullUserPrompt, null, JsonOptions, null, cancellationToken);
             var envelope = response.Result
                 ?? throw new InvalidOperationException($"Step '{step.Id}' returned an empty response envelope.");
+            var validatedEnvelope = ValidateEnvelope(step, envelope);
+            _observer.OnEvent(new AgentResponseReceivedEvent(
+                step.Id,
+                step.Llm,
+                response.Text ?? string.Empty,
+                validatedEnvelope.Ok,
+                validatedEnvelope.Data?.Clone(),
+                validatedEnvelope.Error is null
+                    ? null
+                    : new ErrorInfo(validatedEnvelope.Error.Code, validatedEnvelope.Error.Message, validatedEnvelope.Error.Details?.Clone())));
 
-            return ValidateEnvelope(step, envelope);
+            return validatedEnvelope;
         }
         catch (Exception ex)
         {
+            _observer.OnEvent(new AgentResponseReceivedEvent(
+                step.Id,
+                step.Llm,
+                string.Empty,
+                false,
+                null,
+                new ErrorInfo("llm_error", ex.Message)));
             return ResultEnvelope<JsonElement?>.Failure("llm_error", ex.Message);
         }
     }

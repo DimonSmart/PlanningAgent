@@ -16,10 +16,12 @@ namespace PlanningAgentDemo.Planning;
 public sealed class LlmPlanner(
     IChatClient chatClient,
     IToolRegistry toolRegistry,
-    IExecutionLogger? executionLogger = null) : IPlanner
+    IExecutionLogger? executionLogger = null,
+    IPlanRunObserver? planRunObserver = null) : IPlanner
 {
     private const int MaxPlanningAttempts = 5;
     private readonly IExecutionLogger _log = executionLogger ?? NullExecutionLogger.Instance;
+    private readonly IPlanRunObserver _observer = planRunObserver ?? NullPlanRunObserver.Instance;
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -28,6 +30,7 @@ public sealed class LlmPlanner(
     public async Task<PlanDefinition> CreatePlanAsync(string userQuery, CancellationToken cancellationToken = default)
     {
         _log.Log($"[plan] create:start toolCount={toolRegistry.ListPlannerMetadata().Count} query={Shorten(userQuery, 240)}");
+        _observer.OnEvent(new PlanningAttemptStartedEvent(1, "plan", userQuery));
         return await GeneratePlanCoreAsync(BuildPlanningUserPrompt(userQuery), cancellationToken);
     }
 
@@ -53,12 +56,14 @@ public sealed class LlmPlanner(
 
                 _log.Log($"[plan] create:success steps={plan.Steps.Count} goal={Shorten(plan.Goal, 240)}");
                 _log.Log($"[plan] create:json {JsonSerializer.Serialize(plan, new JsonSerializerOptions { WriteIndented = true })}");
+                _observer.OnEvent(new PlanCreatedEvent(attempt, "plan", ClonePlan(plan)));
                 return plan;
             }
             catch (Exception ex) when (attempt < MaxPlanningAttempts)
             {
                 lastError = ex;
                 _log.Log($"[plan] create:retry attempt={attempt} error={Shorten(ex.Message, 240)}");
+                _observer.OnEvent(new DiagnosticPlanRunEvent("planner", $"Retry {attempt}: {Shorten(ex.Message, 240)}"));
                 planningPrompt = BuildRepairPrompt(userPrompt, ex.Message);
             }
             catch (Exception ex)
@@ -165,11 +170,15 @@ public sealed class LlmPlanner(
         sb.AppendLine("- LLM steps MUST provide both systemPrompt and userPrompt.");
         sb.AppendLine("- The executor appends an Input section with all resolved 'in' values.");
         sb.AppendLine("- Do NOT use template placeholders such as {var} or {{var}} in prompts.");
+        sb.AppendLine("- Do NOT put step refs like $stepId or $stepId.field inside systemPrompt or userPrompt. All dynamic data must come through 'in'.");
         sb.AppendLine("- out is \"json\" or \"string\". Prefer \"json\" unless the final answer is intentionally plain text.");
         sb.AppendLine("- When out is \"json\", the systemPrompt MUST explicitly require valid JSON only.");
         sb.AppendLine("- Use the exact field name \"userPrompt\". Do not use aliases like \"prompt\" or \"instruction\".");
         sb.AppendLine("- Put step parameters under \"in\". Do not place tool args as top-level step properties.");
         sb.AppendLine("- Every step must include id, in, s, res, and err.");
+        sb.AppendLine();
+        sb.AppendLine("Few-shot examples:");
+        sb.AppendLine(BuildFewShotExamples());
         sb.AppendLine();
         sb.AppendLine("Return only the JSON envelope. No markdown fences. No prose outside the JSON.");
         return sb.ToString();
@@ -178,7 +187,34 @@ public sealed class LlmPlanner(
     private static string BuildPlanningUserPrompt(string userQuery) => userQuery;
 
     private static string BuildRepairPrompt(string originalUserPrompt, string errorMessage) =>
-        $"{originalUserPrompt}\n\nYour previous plan was invalid.\nValidation error: {errorMessage}\n\nReturn a corrected ResultEnvelope<PlanDefinition> as JSON only.\nNon-negotiable requirements:\n- Follow the exact ok/data/error envelope schema.\n- Put the full plan inside data when ok=true.\n- Each step must include id, in, s, res, and err.\n- A step must have exactly one of tool or llm.\n- Each llm step must include systemPrompt, userPrompt, and out.\n- Use the exact field names from the schema.\n- Put all step inputs under in.\n- Use only refs to earlier steps.\nDo not repeat the same mistake.";
+        $"{originalUserPrompt}\n\nYour previous plan was invalid.\nValidation error: {errorMessage}\n\nReturn a corrected ResultEnvelope<PlanDefinition> as JSON only.\nNon-negotiable requirements:\n- Follow the exact ok/data/error envelope schema.\n- Put the full plan inside data when ok=true.\n- Each step must include id, in, s, res, and err.\n- A step must have exactly one of tool or llm.\n- Each llm step must include systemPrompt, userPrompt, and out.\n- Do not embed $step refs inside prompts.\n- Use the exact field names from the schema.\n- Put all step inputs under in.\n- Use only refs to earlier steps.\nDo not repeat the same mistake.";
+
+    private static string BuildFewShotExamples() =>
+        """
+        Example A:
+        User request: "Find two popular markdown parsers for .NET, extract license and GitHub repo URL, then recommend one."
+        Good plan shape:
+        1. search candidate pages
+        2. download candidate pages
+        3. extract structured facts from each page with each=true
+        4. compare extracted facts in one final LLM step
+
+        Example B:
+        User request: "Compare two USB microphones by specs and summarize which is better for streaming."
+        Good plan shape:
+        1. search product review pages
+        2. download pages
+        3. extract model name, pickup pattern, sample rate, connectivity, and price from each page
+        4. synthesize a recommendation that names both products and states reasons
+
+        Example C:
+        User request: "Look up two train-route planning libraries and tell me which one better matches small hobby projects."
+        Good plan shape:
+        1. search docs or repo pages
+        2. download those pages
+        3. extract maintenance and onboarding facts from each page
+        4. return a final recommendation
+        """;
 
     private static string Shorten(string? value, int maxLength)
     {
@@ -190,4 +226,8 @@ public sealed class LlmPlanner(
             ? normalized
             : $"{normalized[..maxLength]}...";
     }
+
+    private static PlanDefinition ClonePlan(PlanDefinition plan) =>
+        JsonSerializer.Deserialize<PlanDefinition>(JsonSerializer.Serialize(plan))
+        ?? throw new InvalidOperationException("Failed to clone plan.");
 }

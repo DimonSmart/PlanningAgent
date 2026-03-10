@@ -13,11 +13,13 @@ namespace PlanningAgentDemo.Planning;
 public sealed class LlmReplanner(
     IChatClient chatClient,
     IToolRegistry toolRegistry,
-    IExecutionLogger? executionLogger = null) : IReplanner
+    IExecutionLogger? executionLogger = null,
+    IPlanRunObserver? planRunObserver = null) : IReplanner
 {
     private const int MaxRounds = 6;
     private const int MaxResponseAttempts = 3;
     private readonly IExecutionLogger _log = executionLogger ?? NullExecutionLogger.Instance;
+    private readonly IPlanRunObserver _observer = planRunObserver ?? NullPlanRunObserver.Instance;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -33,6 +35,7 @@ public sealed class LlmReplanner(
         JsonArray? lastActionResults = null;
 
         _log.Log($"[replan] start attempt={request.AttemptNumber} reason={Shorten(request.GoalVerdict.Reason, 240)}");
+        _observer.OnEvent(new ReplanStartedEvent(CloneRequest(request)));
 
         for (var round = 1; round <= MaxRounds; round++)
         {
@@ -46,6 +49,12 @@ public sealed class LlmReplanner(
 
             lastActionResults = ExecuteActions(session, request, actionBatch.Actions);
             _log.Log($"[replan] round={round} actionResults={lastActionResults.ToJsonString(new JsonSerializerOptions { WriteIndented = true })}");
+            _observer.OnEvent(new ReplanRoundCompletedEvent(
+                round,
+                done,
+                reason,
+                JsonSerializer.SerializeToElement(actionBatch, JsonOptions),
+                JsonSerializer.SerializeToElement(lastActionResults, JsonOptions)));
 
             if (!done)
                 continue;
@@ -56,6 +65,7 @@ public sealed class LlmReplanner(
                 PlanValidator.ValidateOrThrow(replanned, workflowTools);
                 _log.Log($"[replan] success steps={replanned.Steps.Count} goal={Shorten(replanned.Goal, 240)}");
                 _log.Log($"[replan] json {JsonSerializer.Serialize(replanned, new JsonSerializerOptions { WriteIndented = true })}");
+                _observer.OnEvent(new ReplanAppliedEvent(ClonePlan(replanned)));
                 return replanned;
             }
             catch (Exception ex) when (round < MaxRounds)
@@ -99,6 +109,7 @@ public sealed class LlmReplanner(
             {
                 lastError = ex;
                 _log.Log($"[replan] response:retry attempt={attempt} error={Shorten(ex.Message, 240)}");
+                _observer.OnEvent(new DiagnosticPlanRunEvent("replanner", $"Response retry {attempt}: {Shorten(ex.Message, 240)}"));
                 currentPrompt = BuildRepairPrompt(roundPrompt, ex.Message);
             }
             catch (Exception ex)
@@ -349,6 +360,20 @@ public sealed class LlmReplanner(
             ? normalized
             : $"{normalized[..maxLength]}...";
     }
+
+    private static PlanDefinition ClonePlan(PlanDefinition plan) =>
+        JsonSerializer.Deserialize<PlanDefinition>(JsonSerializer.Serialize(plan))
+        ?? throw new InvalidOperationException("Failed to clone replanned plan.");
+
+    private static PlannerReplanRequest CloneRequest(PlannerReplanRequest request) =>
+        new()
+        {
+            UserQuery = request.UserQuery,
+            AttemptNumber = request.AttemptNumber,
+            Plan = ClonePlan(request.Plan),
+            ExecutionResult = request.ExecutionResult,
+            GoalVerdict = request.GoalVerdict
+        };
 
     private sealed class ReplanActionBatch
     {

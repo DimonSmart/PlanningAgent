@@ -26,8 +26,8 @@ public sealed class PlanDefinition
 /// <summary>
 /// A single step in the execution plan.
 /// Use <see cref="Tool"/> for registered workflow building blocks (tools), or <see cref="Llm"/> for an ad-hoc LLM call.
-/// When Llm is set, the planner must supply <see cref="SystemPrompt"/> and <see cref="UserPrompt"/>;
-/// the executor simply forwards them to the LLM — there is no pre-registered agent registry.
+/// When <see cref="Llm"/> is set, the planner must supply <see cref="SystemPrompt"/> and <see cref="UserPrompt"/>.
+/// The executor simply forwards them to the LLM; there is no pre-registered agent registry.
 /// LLM steps have NO access to external systems; they can only process data from earlier tool steps.
 /// </summary>
 public sealed class PlanStep
