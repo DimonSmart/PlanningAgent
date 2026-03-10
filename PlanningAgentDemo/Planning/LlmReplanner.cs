@@ -1,7 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Text.Json.Serialization.Metadata;
+using System.Text.Json.Serialization;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 using PlanningAgentDemo.Common;
@@ -21,8 +21,7 @@ public sealed class LlmReplanner(
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
-        PropertyNameCaseInsensitive = true,
-        TypeInfoResolver = new DefaultJsonTypeInfoResolver()
+        PropertyNameCaseInsensitive = true
     };
 
     public async Task<PlanDefinition> ReplanAsync(PlannerReplanRequest request, CancellationToken cancellationToken = default)
@@ -39,14 +38,13 @@ public sealed class LlmReplanner(
         {
             var roundPrompt = BuildRoundPrompt(request, session, round, lastActionResults);
             var actionBatch = await GenerateActionBatchAsync(agent, roundPrompt, cancellationToken);
-            var done = actionBatch["done"]?.GetValue<bool>() ?? false;
-            var reason = actionBatch["reason"]?.GetValue<string>()?.Trim() ?? string.Empty;
-            var actions = actionBatch["actions"] as JsonArray ?? [];
+            var done = actionBatch.Done;
+            var reason = actionBatch.Reason.Trim();
 
-            _log.Log($"[replan] round={round} done={done} actions={actions.Count} reason={Shorten(reason, 240)}");
-            _log.Log($"[replan] round={round} actionBatch={actionBatch.ToJsonString(new JsonSerializerOptions { WriteIndented = true })}");
+            _log.Log($"[replan] round={round} done={done} actions={actionBatch.Actions.Count} reason={Shorten(reason, 240)}");
+            _log.Log($"[replan] round={round} actionBatch={JsonSerializer.Serialize(actionBatch, new JsonSerializerOptions { WriteIndented = true })}");
 
-            lastActionResults = ExecuteActions(session, request, actions);
+            lastActionResults = ExecuteActions(session, request, actionBatch.Actions);
             _log.Log($"[replan] round={round} actionResults={lastActionResults.ToJsonString(new JsonSerializerOptions { WriteIndented = true })}");
 
             if (!done)
@@ -78,7 +76,7 @@ public sealed class LlmReplanner(
         throw new InvalidOperationException($"Replanner could not produce a valid plan after {MaxRounds} rounds.");
     }
 
-    private async Task<JsonObject> GenerateActionBatchAsync(
+    private async Task<ReplanActionBatch> GenerateActionBatchAsync(
         ChatClientAgent agent,
         string roundPrompt,
         CancellationToken cancellationToken)
@@ -88,18 +86,19 @@ public sealed class LlmReplanner(
 
         for (var attempt = 1; attempt <= MaxResponseAttempts; attempt++)
         {
-            var response = await agent.RunAsync<JsonNode?>(currentPrompt, null, JsonOptions, null, cancellationToken);
-
             try
             {
-                return DeserializeActionBatch(response.Result?.DeepClone());
+                var response = await agent.RunAsync<ReplanActionBatch>(currentPrompt, null, JsonOptions, null, cancellationToken);
+                var actionBatch = response.Result
+                    ?? throw new InvalidOperationException("Replanner returned an empty action batch payload.");
+                ValidateActionBatch(actionBatch);
+                return actionBatch;
             }
             catch (Exception ex) when (attempt < MaxResponseAttempts)
             {
                 lastError = ex;
-                var invalidJson = response.Result?.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) ?? "null";
                 _log.Log($"[replan] response:retry attempt={attempt} error={Shorten(ex.Message, 240)}");
-                currentPrompt = BuildRepairPrompt(roundPrompt, invalidJson, ex.Message);
+                currentPrompt = BuildRepairPrompt(roundPrompt, ex.Message);
             }
             catch (Exception ex)
             {
@@ -113,60 +112,17 @@ public sealed class LlmReplanner(
             lastError);
     }
 
-    private static JsonObject DeserializeActionBatch(JsonNode? responseNode)
+    private static void ValidateActionBatch(ReplanActionBatch actionBatch)
     {
-        if (responseNode is not JsonObject root)
-            throw new InvalidOperationException("Replanner did not return a JSON object.");
-
-        root = UnwrapActionRoot(root);
-        if (root["done"] is null)
-            throw new InvalidOperationException("Replanner response must include 'done'.");
-
-        if (root["actions"] is not JsonArray actions)
-            throw new InvalidOperationException("Replanner response must include 'actions' as an array.");
-
-        if (root["done"]?.GetValue<bool>() == false && actions.Count == 0)
+        if (!actionBatch.Done && actionBatch.Actions.Count == 0)
             throw new InvalidOperationException("Replanner must return at least one action when 'done' is false.");
 
-        foreach (var actionNode in actions)
+        foreach (var action in actionBatch.Actions)
         {
-            if (actionNode is not JsonObject action)
-                throw new InvalidOperationException("Each action must be a JSON object.");
-
-            var toolName = action["tool"]?.GetValue<string>()?.Trim();
-            if (string.IsNullOrWhiteSpace(toolName))
+            if (string.IsNullOrWhiteSpace(action.Tool))
                 throw new InvalidOperationException("Each action must include 'tool'.");
-
-            action["tool"] = toolName;
-            action["in"] = action["in"] is JsonObject input ? input : new JsonObject();
         }
-
-        root["reason"] = root["reason"]?.GetValue<string>()?.Trim() ?? string.Empty;
-        return root;
     }
-
-    private static JsonObject UnwrapActionRoot(JsonObject root)
-    {
-        if (HasActionShape(root))
-            return root;
-
-        foreach (var key in new[] { "result", "response", "data" })
-        {
-            if (root[key] is JsonObject nested && HasActionShape(nested))
-                return nested;
-        }
-
-        foreach (var property in root)
-        {
-            if (property.Value is JsonObject nested && HasActionShape(nested))
-                return nested;
-        }
-
-        return root;
-    }
-
-    private static bool HasActionShape(JsonObject node) =>
-        node["done"] is not null || node["actions"] is JsonArray;
 
     private static string BuildSystemPrompt(IReadOnlyCollection<ToolPlannerMetadata> workflowTools)
     {
@@ -240,37 +196,29 @@ public sealed class LlmReplanner(
         return $"Repair the working plan using the plan-editing tools.\n\nReplanning context:\n{context.ToJsonString(new JsonSerializerOptions { WriteIndented = true })}";
     }
 
-    private static string BuildRepairPrompt(string originalPrompt, string invalidResponseJson, string errorMessage) =>
-        $"{originalPrompt}\n\nYour previous response was invalid.\nValidation error: {errorMessage}\nInvalid response:\n{invalidResponseJson}\n\nReturn a corrected action batch as JSON only.";
+    private static string BuildRepairPrompt(string originalPrompt, string errorMessage) =>
+        $"{originalPrompt}\n\nYour previous response was invalid.\nValidation error: {errorMessage}\n\nReturn a corrected action batch as JSON only and follow the exact schema.";
 
     private static JsonArray ExecuteActions(
         PlanEditingSession session,
         PlannerReplanRequest request,
-        JsonArray actions)
+        IReadOnlyCollection<ReplanAction> actions)
     {
         var results = new JsonArray();
 
-        foreach (var actionNode in actions)
+        foreach (var action in actions)
         {
-            if (actionNode is not JsonObject action)
-            {
-                results.Add(CreateToolFailure("invalid_action", "Each action must be a JSON object."));
-                continue;
-            }
-
-            var toolName = action["tool"]?.GetValue<string>()?.Trim();
-            results.Add(string.Equals(toolName, "runtime.readFailedTrace", StringComparison.Ordinal)
+            results.Add(string.Equals(action.Tool, "runtime.readFailedTrace", StringComparison.Ordinal)
                 ? ExecuteRuntimeReadFailedTrace(request, action)
-                : session.ExecuteAction(action));
+                : session.ExecuteAction(action.Tool, action.Input));
         }
 
         return results;
     }
 
-    private static JsonObject ExecuteRuntimeReadFailedTrace(PlannerReplanRequest request, JsonObject action)
+    private static JsonObject ExecuteRuntimeReadFailedTrace(PlannerReplanRequest request, ReplanAction action)
     {
-        var input = action["in"] as JsonObject ?? [];
-        var stepId = input["stepId"]?.GetValue<string>()?.Trim();
+        var stepId = action.Input["stepId"]?.GetValue<string>()?.Trim();
         if (string.IsNullOrWhiteSpace(stepId))
             return CreateToolFailure("tool_error", "Action input 'stepId' is required.", "runtime.readFailedTrace");
 
@@ -377,5 +325,29 @@ public sealed class LlmReplanner(
         return normalized.Length <= maxLength
             ? normalized
             : $"{normalized[..maxLength]}...";
+    }
+
+    private sealed class ReplanActionBatch
+    {
+        [JsonRequired]
+        [JsonPropertyName("done")]
+        public bool Done { get; init; }
+
+        [JsonPropertyName("reason")]
+        public string Reason { get; init; } = string.Empty;
+
+        [JsonRequired]
+        [JsonPropertyName("actions")]
+        public List<ReplanAction> Actions { get; init; } = [];
+    }
+
+    private sealed class ReplanAction
+    {
+        [JsonRequired]
+        [JsonPropertyName("tool")]
+        public string Tool { get; init; } = string.Empty;
+
+        [JsonPropertyName("in")]
+        public JsonObject Input { get; init; } = [];
     }
 }

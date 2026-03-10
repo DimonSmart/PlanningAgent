@@ -19,26 +19,8 @@ public sealed class PlanEditingSession
 
     public PlanDefinition BuildPlan() => _plan;
 
-    public JsonArray ExecuteActions(JsonArray actions)
+    public JsonObject ExecuteAction(string toolName, JsonObject input)
     {
-        var results = new JsonArray();
-
-        foreach (var actionNode in actions)
-        {
-            var result = actionNode is JsonObject action
-                ? ExecuteAction(action)
-                : CreateFailure("invalid_action", "Each action must be a JSON object.");
-            results.Add(result);
-        }
-
-        return results;
-    }
-
-    public JsonObject ExecuteAction(JsonObject action)
-    {
-        var toolName = action["tool"]?.GetValue<string>()?.Trim();
-        var input = action["in"] as JsonObject ?? [];
-
         try
         {
             return toolName switch

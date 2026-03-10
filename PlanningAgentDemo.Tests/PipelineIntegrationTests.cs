@@ -243,7 +243,7 @@ public class PipelineTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public async Task LlmPlanner_NormalizesCommonPlannerAliases_IntoExecutablePlan()
+    public async Task LlmPlanner_RejectsNonCanonicalPlanShape()
     {
         var planner = new LlmPlanner(
             new StubChatClient(
@@ -274,21 +274,8 @@ public class PipelineTests(ITestOutputHelper output)
             BuildTools(),
             new TestLogger(output));
 
-        var plan = await planner.CreatePlanAsync("Compare two popular robot vacuums.");
-
-        Assert.Equal("search", plan.Steps[0].Tool);
-        Assert.False(string.IsNullOrWhiteSpace(plan.Steps[0].Id));
-        Assert.Equal("popular robot vacuum cleaner", plan.Steps[0].In["query"]?.GetValue<string>());
-        Assert.Equal(2, plan.Steps[0].In["limit"]?.GetValue<int>());
-
-        Assert.Equal("download", plan.Steps[1].Tool);
-        Assert.Equal("$search", plan.Steps[1].In["url"]?.GetValue<string>());
-
-        Assert.Equal("compare_models", plan.Steps[2].Llm);
-        Assert.Equal("Return ONLY valid JSON.", plan.Steps[2].SystemPrompt);
-        Assert.Equal("Compare the provided items and recommend one model.", plan.Steps[2].UserPrompt);
-        Assert.Equal("json", plan.Steps[2].Out);
-        Assert.Equal("$download_pages", plan.Steps[2].In["items"]?.GetValue<string>());
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => planner.CreatePlanAsync("Compare two popular robot vacuums."));
     }
 
     [Fact]
@@ -620,7 +607,9 @@ public class PipelineTests(ITestOutputHelper output)
             }
             """)!.AsObject();
 
-        var result = session.ExecuteAction(action);
+        var result = session.ExecuteAction(
+            action["tool"]?.GetValue<string>() ?? string.Empty,
+            action["in"]?.AsObject() ?? []);
 
         Assert.True(result["ok"]?.GetValue<bool>());
         Assert.Equal(PlanStepStatuses.Done, plan.Steps[0].Status);
