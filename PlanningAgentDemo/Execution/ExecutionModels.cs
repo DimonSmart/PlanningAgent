@@ -9,6 +9,8 @@ public sealed record StepExecutionTrace
 
     public bool Success { get; init; }
 
+    public bool Reused { get; init; }
+
     public string? ErrorCode { get; init; }
 
     public string? ErrorMessage { get; init; }

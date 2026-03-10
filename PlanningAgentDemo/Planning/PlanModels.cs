@@ -3,11 +3,21 @@ using System.Text.Json.Serialization;
 
 namespace PlanningAgentDemo.Planning;
 
+public static class PlanStepStatuses
+{
+    public const string Todo = "todo";
+    public const string Done = "done";
+    public const string Fail = "fail";
+    public const string Skip = "skip";
+}
+
 public sealed class PlanDefinition
 {
+    [JsonRequired]
     [JsonPropertyName("goal")]
     public string Goal { get; init; } = string.Empty;
 
+    [JsonRequired]
     [JsonPropertyName("steps")]
     public List<PlanStep> Steps { get; init; } = new();
 }
@@ -21,6 +31,7 @@ public sealed class PlanDefinition
 /// </summary>
 public sealed class PlanStep
 {
+    [JsonRequired]
     [JsonPropertyName("id")]
     public string Id { get; init; } = string.Empty;
 
@@ -41,6 +52,7 @@ public sealed class PlanStep
     public string? UserPrompt { get; init; }
 
     /// <summary>Input bindings. String values starting with '$' are references to previous step outputs.</summary>
+    [JsonRequired]
     [JsonPropertyName("in")]
     public Dictionary<string, JsonNode?> In { get; init; } = new();
 
@@ -55,4 +67,25 @@ public sealed class PlanStep
     /// </summary>
     [JsonPropertyName("each")]
     public bool Each { get; init; }
+
+    [JsonPropertyName("s")]
+    public string Status { get; set; } = PlanStepStatuses.Todo;
+
+    [JsonPropertyName("res")]
+    public JsonNode? Result { get; set; }
+
+    [JsonPropertyName("err")]
+    public PlanStepError? Error { get; set; }
+}
+
+public sealed class PlanStepError
+{
+    [JsonPropertyName("code")]
+    public string Code { get; init; } = string.Empty;
+
+    [JsonPropertyName("message")]
+    public string Message { get; init; } = string.Empty;
+
+    [JsonPropertyName("details")]
+    public JsonObject? Details { get; init; }
 }

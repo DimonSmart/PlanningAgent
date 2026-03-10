@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using PlanningAgentDemo.Agents;
 using PlanningAgentDemo.Common;
@@ -7,18 +8,6 @@ using PlanningAgentDemo.Verification;
 
 namespace PlanningAgentDemo.Execution;
 
-using System.Text.Json;
-
-/// <summary>
-/// Executes a PlanDefinition step by step.
-///
-/// Auto-map rule:
-///   If a tool input declared as scalar in its schema receives a JsonArray from a $ref,
-///   the executor fans out: calls the tool once per element &#x2192; collects results into an array.
-///   Same for agent steps: if ExpectsArray on the step is not set and input is an array,
-///   the executor calls the agent once per element.
-///   The planner never needs foreach/batch � auto-map happens transparently.
-/// </summary>
 public sealed class PlanExecutor(
     IToolRegistry toolRegistry,
     IAgentStepRunner agentStepRunner,
@@ -28,293 +17,458 @@ public sealed class PlanExecutor(
 
     public async Task<ExecutionResult> ExecuteAsync(
         PlanDefinition plan,
-        ExecutionStore store,
         CancellationToken cancellationToken = default)
     {
         var traces = new List<StepExecutionTrace>();
-        var pending = plan.Steps.ToDictionary(s => s.Id, StringComparer.Ordinal);
+        var stepMap = plan.Steps.ToDictionary(step => step.Id, StringComparer.Ordinal);
         ResultEnvelope<JsonNode?>? lastEnvelope = null;
 
-        while (pending.Count > 0)
+        foreach (var step in plan.Steps)
         {
-            var missingByStep = pending.Values.ToDictionary(s => s, s => GetMissingRefs(s, store));
-            var ready = missingByStep
-                .Where(e => e.Value.Count == 0)
-                .Select(e => e.Key)
-                .OrderBy(s => s.Id, StringComparer.Ordinal)
-                .ToList();
-
-            if (ready.Count == 0)
+            if (IsReusable(step))
             {
-                var detail = string.Join("; ", missingByStep
-                    .OrderBy(e => e.Key.Id)
-                    .Select(e => $"'{e.Key.Id}' missing [{string.Join(", ", e.Value)}]"));
-                throw new InvalidOperationException($"Unresolved dependencies: {detail}");
+                _log.Log($"[exec] step:reuse id={step.Id}");
+                traces.Add(new StepExecutionTrace
+                {
+                    StepId = step.Id,
+                    Success = true,
+                    Reused = true
+                });
+                continue;
             }
 
-            foreach (var step in ready)
-            {
-                var (trace, envelope) = await ExecuteStepAsync(step, store, cancellationToken);
-                traces.Add(trace);
-                lastEnvelope = envelope;
+            var missingRefs = GetMissingRefs(step, stepMap);
+            if (missingRefs.Count > 0)
+                throw new InvalidOperationException($"Step '{step.Id}' is not ready. Missing resolved refs: {string.Join(", ", missingRefs)}");
 
-                if (!trace.Success)
-                    return new ExecutionResult { StepTraces = traces, LastEnvelope = lastEnvelope };
+            PlanExecutionState.ResetStep(step);
 
-                if (trace.VerificationIssues.Count > 0)
-                    return new ExecutionResult { StepTraces = traces, LastEnvelope = lastEnvelope };
+            var (trace, envelope) = await ExecuteStepAsync(step, stepMap, cancellationToken);
+            traces.Add(trace);
+            lastEnvelope = envelope;
 
-                pending.Remove(step.Id);
-            }
+            if (!trace.Success)
+                return new ExecutionResult { StepTraces = traces, LastEnvelope = lastEnvelope };
         }
 
         return new ExecutionResult { StepTraces = traces, LastEnvelope = lastEnvelope };
     }
 
-    // -----------------------------------------------------------------------
-
-    private async Task<(StepExecutionTrace trace, ResultEnvelope<JsonNode?>? envelope)> ExecuteStepAsync(
-        PlanStep step, ExecutionStore store, CancellationToken ct)
+    private async Task<(StepExecutionTrace trace, ResultEnvelope<JsonNode?> envelope)> ExecuteStepAsync(
+        PlanStep step,
+        IReadOnlyDictionary<string, PlanStep> stepMap,
+        CancellationToken cancellationToken)
     {
         var calls = new List<JsonObject>();
         var outputs = new List<JsonNode?>();
-        ResultEnvelope<JsonNode?>? lastEnv = null;
 
-        // Resolve $ref inputs > detect auto-map (array on scalar parameter)
-        var (resolved, autoMapKey, fanOutArray) = ResolveInputs(step, store);
+        var (resolved, fanOutInputs) = ResolveInputs(step, stepMap);
+        var isTool = !string.IsNullOrWhiteSpace(step.Tool);
+        var fanOutCount = fanOutInputs?.Values.FirstOrDefault()?.Count ?? 0;
 
-        bool isTool = !string.IsNullOrEmpty(step.Tool);
+        _log.Log($"[exec] step:start id={step.Id} kind={(isTool ? "tool" : "llm")} name={(isTool ? step.Tool : step.Llm)} fanOut={(fanOutInputs is null ? "no" : fanOutCount.ToString())} resolvedInputs={SerializeNode(resolved)}");
 
-        _log.Log($"[exec] step:start id={step.Id} kind={(isTool ? "tool" : "llm")} name={(isTool ? step.Tool : step.Llm)} fanOut={fanOutArray?.Count.ToString() ?? "no"} resolvedInputs={SerializeNode(resolved)}");
-
-        if (fanOutArray is not null)
+        ResultEnvelope<JsonNode?> envelope;
+        if (fanOutInputs is null)
         {
-            // Fan-out: call once per array element, substitute scalar value each time
-            for (var index = 0; index < fanOutArray.Count; index++)
-            {
-                var item = fanOutArray[index];
-                var singleInput = SubstituteScalar(resolved, autoMapKey!, item);
-                _log.Log($"[exec] call:start step={step.Id} callIndex={index} input={SerializeNode(singleInput)}");
-                lastEnv = isTool
-                    ? await RunToolAsync(step.Tool!, singleInput, calls, ct)
-                    : await RunAgentAsync(step, singleInput, calls, ct);
+            _log.Log($"[exec] call:start step={step.Id} callIndex=0 input={SerializeNode(resolved)}");
+            envelope = isTool
+                ? await RunToolAsync(step.Tool!, resolved, calls, cancellationToken)
+                : await RunAgentAsync(step, resolved, calls, cancellationToken);
+            _log.Log($"[exec] call:end step={step.Id} callIndex=0 ok={envelope.Ok} output={SerializeNode(envelope.Data)} error={Shorten(envelope.Error?.Message, 240)} details={SerializeNode(envelope.Error?.Details)}");
 
-                _log.Log($"[exec] call:end step={step.Id} callIndex={index} ok={lastEnv.Ok} output={SerializeNode(lastEnv.Data)} error={Shorten(lastEnv.Error?.Message, 240)}");
-
-                if (!lastEnv.Ok) break;
-                outputs.Add(lastEnv.Data?.DeepClone());
-            }
+            if (envelope.Ok)
+                outputs.Add(envelope.Data?.DeepClone());
         }
         else
         {
-            _log.Log($"[exec] call:start step={step.Id} callIndex=0 input={SerializeNode(resolved)}");
-            lastEnv = isTool
-                ? await RunToolAsync(step.Tool!, resolved, calls, ct)
-                : await RunAgentAsync(step, resolved, calls, ct);
+            envelope = ResultEnvelope<JsonNode?>.Success(null);
+            for (var callIndex = 0; callIndex < fanOutCount; callIndex++)
+            {
+                var singleInput = SubstituteScalars(resolved, fanOutInputs, callIndex);
+                _log.Log($"[exec] call:start step={step.Id} callIndex={callIndex} input={SerializeNode(singleInput)}");
+                envelope = isTool
+                    ? await RunToolAsync(step.Tool!, singleInput, calls, cancellationToken)
+                    : await RunAgentAsync(step, singleInput, calls, cancellationToken);
+                _log.Log($"[exec] call:end step={step.Id} callIndex={callIndex} ok={envelope.Ok} output={SerializeNode(envelope.Data)} error={Shorten(envelope.Error?.Message, 240)} details={SerializeNode(envelope.Error?.Details)}");
 
-            _log.Log($"[exec] call:end step={step.Id} callIndex=0 ok={lastEnv.Ok} output={SerializeNode(lastEnv.Data)} error={Shorten(lastEnv.Error?.Message, 240)}");
+                if (!envelope.Ok)
+                    break;
 
-            if (lastEnv.Ok) outputs.Add(lastEnv.Data?.DeepClone());
+                outputs.Add(envelope.Data?.DeepClone());
+            }
         }
 
-        // Write aggregated result to store under step.Id
         if (outputs.Count > 0)
         {
-            store.Set(step.Id, fanOutArray is not null
-                ? new JsonArray(outputs.Select(o => o?.DeepClone()).ToArray())
-                : outputs[0]?.DeepClone());
-
-            store.TryGet(step.Id, out var storedOutput);
-            _log.Log($"[exec] step:stored id={step.Id} output={SerializeNode(storedOutput)}");
+            step.Result = fanOutInputs is null
+                ? outputs[0]?.DeepClone()
+                : new JsonArray(outputs.Select(output => output?.DeepClone()).ToArray());
         }
 
-        bool success = lastEnv?.Ok ?? false;
-        List<StepVerificationIssue> verificationIssues = [];
-
-        if (success)
+        if (!envelope.Ok)
         {
-            store.TryGet(step.Id, out var storedOutput);
-            verificationIssues = StepOutputVerifier.Verify(step, storedOutput);
+            step.Status = PlanStepStatuses.Fail;
+            step.Error = CreatePlanStepError(envelope.Error);
+            _log.Log($"[exec] step:end id={step.Id} success=False calls={calls.Count} error={Shorten(step.Error?.Message, 240)} details={SerializeNode(step.Error?.Details)}");
+            return (CreateTrace(step, success: false, reused: false, calls, []), envelope);
+        }
+
+        var verificationIssues = StepOutputVerifier.Verify(step, step.Result);
+        if (verificationIssues.Count > 0)
+        {
+            step.Status = PlanStepStatuses.Fail;
+            step.Error = CreateVerificationError(step.Id, verificationIssues);
             foreach (var issue in verificationIssues)
                 _log.Log($"[verify] step={step.Id} code={issue.Code} message={issue.Message}");
+
+            envelope = ResultEnvelope<JsonNode?>.Failure(step.Error.Code, step.Error.Message, step.Error.Details?.DeepClone() as JsonObject);
+            _log.Log($"[exec] step:end id={step.Id} success=False calls={calls.Count} error={Shorten(step.Error.Message, 240)} details={SerializeNode(step.Error.Details)}");
+            return (CreateTrace(step, success: false, reused: false, calls, verificationIssues), envelope);
         }
 
-        _log.Log($"[exec] step:end id={step.Id} success={success} calls={calls.Count} error={Shorten(lastEnv?.Error?.Message, 240)}");
-
-        var trace = new StepExecutionTrace
-        {
-            StepId = step.Id,
-            Success = success,
-            ErrorCode = success ? null : lastEnv?.Error?.Code,
-            ErrorMessage = success ? null : lastEnv?.Error?.Message,
-            ErrorDetails = success ? null : lastEnv?.Error?.Details,
-            VerificationIssues = verificationIssues
-        };
-        foreach (var c in calls) trace.Calls.Add(c);
-
-        return (trace, lastEnv);
+        step.Status = PlanStepStatuses.Done;
+        step.Error = null;
+        _log.Log($"[exec] step:stored id={step.Id} output={SerializeNode(step.Result)}");
+        _log.Log($"[exec] step:end id={step.Id} success=True calls={calls.Count} error=<none> details=null");
+        return (CreateTrace(step, success: true, reused: false, calls, []), envelope);
     }
 
-    // -----------------------------------------------------------------------
-
     private async Task<ResultEnvelope<JsonNode?>> RunToolAsync(
-        string toolName, JsonObject input, List<JsonObject> calls, CancellationToken ct)
+        string toolName,
+        JsonObject input,
+        List<JsonObject> calls,
+        CancellationToken cancellationToken)
     {
         var tool = toolRegistry.GetRequired(toolName);
-        var env = await tool.ExecuteAsync(input, ct);
-        calls.Add(new JsonObject { ["tool"] = toolName, ["input"] = input.DeepClone(), ["ok"] = env.Ok, ["output"] = env.Data?.DeepClone() });
-        return env;
+        var envelope = await tool.ExecuteAsync(input, cancellationToken);
+        calls.Add(new JsonObject
+        {
+            ["tool"] = toolName,
+            ["input"] = input.DeepClone(),
+            ["ok"] = envelope.Ok,
+            ["output"] = envelope.Data?.DeepClone(),
+            ["error"] = SerializeError(envelope.Error)
+        });
+        return envelope;
     }
 
     private async Task<ResultEnvelope<JsonNode?>> RunAgentAsync(
-        PlanStep step, JsonObject input, List<JsonObject> calls, CancellationToken ct)
+        PlanStep step,
+        JsonObject input,
+        List<JsonObject> calls,
+        CancellationToken cancellationToken)
     {
-        var env = await agentStepRunner.ExecuteAsync(step, input, ct);
-        calls.Add(new JsonObject { ["llm"] = step.Llm, ["ok"] = env.Ok, ["output"] = env.Data?.DeepClone() });
-        return env;
+        var envelope = await agentStepRunner.ExecuteAsync(step, input, cancellationToken);
+        calls.Add(new JsonObject
+        {
+            ["llm"] = step.Llm,
+            ["ok"] = envelope.Ok,
+            ["output"] = envelope.Data?.DeepClone(),
+            ["error"] = SerializeError(envelope.Error)
+        });
+        return envelope;
     }
 
-    // -----------------------------------------------------------------------
-    // Input resolution + auto-map detection
-
-    private (JsonObject resolved, string? autoMapKey, JsonArray? fanOutArray) ResolveInputs(
-        PlanStep step, ExecutionStore store)
+    private (JsonObject resolved, Dictionary<string, JsonArray>? fanOutInputs) ResolveInputs(
+        PlanStep step,
+        IReadOnlyDictionary<string, PlanStep> stepMap)
     {
         var resolved = new JsonObject();
-        string? autoMapKey = null;
-        JsonArray? fanOutArray = null;
+        Dictionary<string, JsonArray>? fanOutInputs = null;
+        var isTool = !string.IsNullOrWhiteSpace(step.Tool);
 
-        bool isTool = !string.IsNullOrEmpty(step.Tool);
-
-        foreach (var kvp in step.In)
+        foreach (var input in step.In)
         {
-            if (kvp.Value is JsonValue jv && jv.TryGetValue<string>(out var s) && s.StartsWith('$'))
+            if (input.Value is JsonValue value
+                && value.TryGetValue<string>(out var text)
+                && text.StartsWith("$", StringComparison.Ordinal))
             {
-                var (sourceVal, isExplicit) = ParseStepRef(s[1..], step.Id, store);
-
-                // Auto-fan-out only for plain $stepId refs, not $stepId[n] or $stepId.field
-                // (explicit accessors mean the planner already selected a specific value).
-                if (!isExplicit && sourceVal is JsonArray arr)
+                var resolution = ParseStepRef(text[1..], step.Id, stepMap);
+                if (!resolution.SuppressAutoMap && resolution.Value is JsonArray array)
                 {
-                    // Tools: fan-out based on schema (scalar param + array input).
-                    // LLM steps: fan-out only when the plan explicitly marks each:true.
-                    bool expectsScalar = isTool
-                        ? ToolExpectsScalar(step.Tool!, kvp.Key)
+                    var expectsScalar = isTool
+                        ? ToolExpectsScalar(step.Tool!, input.Key)
                         : step.Each;
 
-                    if (expectsScalar && autoMapKey is null)
+                    if (expectsScalar)
                     {
-                        autoMapKey = kvp.Key;
-                        fanOutArray = arr;
-                        resolved[kvp.Key] = arr.DeepClone(); // placeholder, replaced per-call
+                        fanOutInputs ??= new Dictionary<string, JsonArray>(StringComparer.Ordinal);
+                        fanOutInputs[input.Key] = array;
+                        resolved[input.Key] = array.DeepClone();
                         continue;
                     }
                 }
 
-                resolved[kvp.Key] = sourceVal?.DeepClone();
+                resolved[input.Key] = resolution.Value?.DeepClone();
+                continue;
+            }
+
+            resolved[input.Key] = input.Value?.DeepClone();
+        }
+
+        if (fanOutInputs is not null)
+            ValidateFanOutInputs(step, fanOutInputs);
+
+        return (resolved, fanOutInputs);
+    }
+
+    private static bool IsReusable(PlanStep step) =>
+        PlanExecutionState.IsDone(step)
+        || string.Equals(step.Status, PlanStepStatuses.Skip, StringComparison.Ordinal);
+
+    private sealed record RefResolution(JsonNode? Value, bool SuppressAutoMap);
+
+    private static RefResolution ParseStepRef(
+        string expression,
+        string currentStepId,
+        IReadOnlyDictionary<string, PlanStep> stepMap)
+    {
+        var stepId = expression;
+        int? arrayIndex = null;
+        var projectArray = false;
+        string? fieldName = null;
+
+        var bracketStart = expression.IndexOf('[');
+        if (bracketStart >= 0)
+        {
+            stepId = expression[..bracketStart];
+            var bracketEnd = expression.IndexOf(']', bracketStart);
+            if (bracketEnd < 0)
+                throw new InvalidOperationException($"Step '{currentStepId}': invalid ref '${expression}' - unclosed '['.");
+
+            var indexToken = expression[(bracketStart + 1)..bracketEnd];
+            if (indexToken.Length == 0)
+            {
+                projectArray = true;
+            }
+            else if (int.TryParse(indexToken, out var parsedIndex))
+            {
+                arrayIndex = parsedIndex;
             }
             else
             {
-                resolved[kvp.Key] = kvp.Value?.DeepClone();
+                throw new InvalidOperationException($"Step '{currentStepId}': invalid array index in '${expression}'.");
             }
-        }
 
-        return (resolved, autoMapKey, fanOutArray);
-    }
-
-    /// <summary>
-    /// Resolves a step-reference expression (the part after '$') to a JsonNode.
-    /// Supported forms:
-    ///   stepId           – full output of a previous step
-    ///   stepId[n]        – element n of an array output (0-based)
-    ///   stepId.field     – named field of an object output
-    ///   stepId[n].field  – field of the n-th array element
-    /// Returns (value, isExplicit) where isExplicit=true when an index or field accessor
-    /// is present, suppressing auto-fan-out in the caller.
-    /// </summary>
-    private static (JsonNode? value, bool isExplicit) ParseStepRef(
-        string expr, string currentStepId, ExecutionStore store)
-    {
-        var stepId = expr;
-        int? arrayIndex = null;
-        string? fieldName = null;
-
-        var bracketStart = expr.IndexOf('[');
-        if (bracketStart >= 0)
-        {
-            stepId = expr[..bracketStart];
-            var bracketEnd = expr.IndexOf(']', bracketStart);
-            if (bracketEnd < 0)
-                throw new InvalidOperationException(
-                    $"Step '{currentStepId}': invalid ref '${expr}' — unclosed '['.");
-            if (!int.TryParse(expr[(bracketStart + 1)..bracketEnd], out var idx))
-                throw new InvalidOperationException(
-                    $"Step '{currentStepId}': invalid array index in '${expr}'.");
-            arrayIndex = idx;
-            if (bracketEnd + 1 < expr.Length && expr[bracketEnd + 1] == '.')
-                fieldName = expr[(bracketEnd + 2)..];
+            if (bracketEnd + 1 < expression.Length && expression[bracketEnd + 1] == '.')
+                fieldName = expression[(bracketEnd + 2)..];
         }
         else
         {
-            var dot = expr.IndexOf('.');
-            if (dot >= 0)
+            var dotIndex = expression.IndexOf('.');
+            if (dotIndex >= 0)
             {
-                stepId = expr[..dot];
-                fieldName = expr[(dot + 1)..];
+                stepId = expression[..dotIndex];
+                fieldName = expression[(dotIndex + 1)..];
             }
         }
 
-        if (!store.TryGet(stepId, out var node))
-            throw new InvalidOperationException(
-                $"Step '{currentStepId}': ref '${expr}' — step '{stepId}' not found in store.");
+        if (!stepMap.TryGetValue(stepId, out var referencedStep))
+            throw new InvalidOperationException($"Step '{currentStepId}': ref '${expression}' - step '{stepId}' not found.");
 
-        bool isExplicit = arrayIndex.HasValue || fieldName != null;
+        if (!PlanExecutionState.IsDone(referencedStep) || referencedStep.Result is null)
+            throw new InvalidOperationException($"Step '{currentStepId}': ref '${expression}' - step '{stepId}' has no completed result.");
+
+        var node = referencedStep.Result;
+        if (projectArray)
+        {
+            if (node is not JsonArray projectedArray)
+                throw new InvalidOperationException($"Step '{currentStepId}': ref '${expression}' - step '{stepId}' output is not a JsonArray.");
+
+            if (fieldName is null)
+                return new RefResolution(projectedArray.DeepClone(), SuppressAutoMap: false);
+
+            return new RefResolution(ProjectArrayField(projectedArray, fieldName, currentStepId, expression), SuppressAutoMap: false);
+        }
 
         if (arrayIndex.HasValue)
         {
-            if (node is not JsonArray arr)
-                throw new InvalidOperationException(
-                    $"Step '{currentStepId}': ref '${expr}' — step '{stepId}' output is not a JsonArray.");
-            if (arrayIndex.Value >= arr.Count)
-                throw new InvalidOperationException(
-                    $"Step '{currentStepId}': ref '${expr}' — index {arrayIndex} out of range (count={arr.Count}).");
-            node = arr[arrayIndex.Value];
+            if (node is not JsonArray indexedArray)
+                throw new InvalidOperationException($"Step '{currentStepId}': ref '${expression}' - step '{stepId}' output is not a JsonArray.");
+            if (arrayIndex.Value < 0 || arrayIndex.Value >= indexedArray.Count)
+                throw new InvalidOperationException($"Step '{currentStepId}': ref '${expression}' - index {arrayIndex} out of range (count={indexedArray.Count}).");
+
+            node = indexedArray[arrayIndex.Value];
         }
 
-        if (fieldName != null)
+        if (fieldName is null)
+            return new RefResolution(node?.DeepClone(), SuppressAutoMap: arrayIndex.HasValue);
+
+        return node switch
         {
-            if (node is not JsonObject obj)
-                throw new InvalidOperationException(
-                    $"Step '{currentStepId}': ref '${expr}' — cannot access field '{fieldName}' on non-object.");
-            obj.TryGetPropertyValue(fieldName, out node);
-        }
-
-        return (node, isExplicit);
+            JsonObject obj => new RefResolution(obj[fieldName]?.DeepClone(), SuppressAutoMap: arrayIndex.HasValue),
+            JsonArray array => new RefResolution(ProjectArrayField(array, fieldName, currentStepId, expression), SuppressAutoMap: false),
+            _ => throw new InvalidOperationException($"Step '{currentStepId}': ref '${expression}' - cannot access field '{fieldName}' on non-object.")
+        };
     }
 
     private bool ToolExpectsScalar(string toolName, string paramName)
     {
-        var meta = toolRegistry.GetRequired(toolName).PlannerMetadata;
-        if (!meta.InputSchema.TryGetPropertyValue("properties", out var props) || props is not JsonObject propsObj)
-            return true; // assume scalar when no schema
-        if (!propsObj.TryGetPropertyValue(paramName, out var pDef) || pDef is not JsonObject pDefObj)
+        var metadata = toolRegistry.GetRequired(toolName).PlannerMetadata;
+        if (!metadata.InputSchema.TryGetPropertyValue("properties", out var propertiesNode) || propertiesNode is not JsonObject properties)
             return true;
-        if (!pDefObj.TryGetPropertyValue("type", out var typeProp))
+        if (!properties.TryGetPropertyValue(paramName, out var parameterNode) || parameterNode is not JsonObject parameter)
             return true;
-        return typeProp?.ToString() != "array";
+        if (!parameter.TryGetPropertyValue("type", out var typeNode))
+            return true;
+
+        return !string.Equals(typeNode?.ToString(), "array", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static JsonObject SubstituteScalar(JsonObject resolved, string key, JsonNode? value)
+    private static JsonObject SubstituteScalars(
+        JsonObject resolved,
+        IReadOnlyDictionary<string, JsonArray> fanOutInputs,
+        int index)
     {
         var copy = (JsonObject)resolved.DeepClone();
-        copy[key] = value?.DeepClone();
+        foreach (var fanOutInput in fanOutInputs)
+            copy[fanOutInput.Key] = fanOutInput.Value[index]?.DeepClone();
+
         return copy;
     }
 
-    private static string SerializeNode(JsonNode? node)
+    private static void ValidateFanOutInputs(PlanStep step, IReadOnlyDictionary<string, JsonArray> fanOutInputs)
     {
-        return node?.ToJsonString(new JsonSerializerOptions { WriteIndented = false }) ?? "null";
+        var expectedCount = fanOutInputs.First().Value.Count;
+        foreach (var fanOutInput in fanOutInputs)
+        {
+            if (fanOutInput.Value.Count != expectedCount)
+            {
+                throw new InvalidOperationException(
+                    $"Step '{step.Id}' resolves multiple array inputs with different lengths. Cannot zip fan-out '{fanOutInputs.First().Key}' ({expectedCount}) and '{fanOutInput.Key}' ({fanOutInput.Value.Count}).");
+            }
+        }
     }
+
+    private static JsonArray ProjectArrayField(JsonArray array, string fieldName, string currentStepId, string expression)
+    {
+        var projected = new JsonArray();
+        foreach (var item in array)
+        {
+            if (item is not JsonObject obj)
+            {
+                throw new InvalidOperationException(
+                    $"Step '{currentStepId}': ref '${expression}' - cannot access field '{fieldName}' on non-object array item.");
+            }
+
+            projected.Add(obj[fieldName]?.DeepClone());
+        }
+
+        return projected;
+    }
+
+    private static List<string> GetMissingRefs(PlanStep step, IReadOnlyDictionary<string, PlanStep> stepMap)
+    {
+        var missing = new List<string>();
+        foreach (var value in step.In.Values)
+        {
+            if (value is not JsonValue jsonValue
+                || !jsonValue.TryGetValue<string>(out var text)
+                || !text.StartsWith("$", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var stepId = ExtractBaseStepId(text[1..]);
+            if (!stepMap.TryGetValue(stepId, out var dependency)
+                || !PlanExecutionState.IsDone(dependency)
+                || dependency.Result is null)
+            {
+                missing.Add(text);
+            }
+        }
+
+        return missing;
+    }
+
+    private static string ExtractBaseStepId(string expression)
+    {
+        var bracketIndex = expression.IndexOf('[');
+        var dotIndex = expression.IndexOf('.');
+        if (bracketIndex >= 0 && dotIndex >= 0)
+            return expression[..Math.Min(bracketIndex, dotIndex)];
+        if (bracketIndex >= 0)
+            return expression[..bracketIndex];
+        if (dotIndex >= 0)
+            return expression[..dotIndex];
+        return expression;
+    }
+
+    private static StepExecutionTrace CreateTrace(
+        PlanStep step,
+        bool success,
+        bool reused,
+        IEnumerable<JsonObject> calls,
+        IReadOnlyCollection<StepVerificationIssue> verificationIssues) => new()
+    {
+        StepId = step.Id,
+        Success = success,
+        Reused = reused,
+        ErrorCode = success ? null : step.Error?.Code,
+        ErrorMessage = success ? null : step.Error?.Message,
+        ErrorDetails = success ? null : step.Error?.Details?.DeepClone() as JsonObject,
+        Calls = calls.Select(call => (JsonObject)call.DeepClone()).ToList(),
+        VerificationIssues = verificationIssues
+            .Select(issue => new StepVerificationIssue
+            {
+                Code = issue.Code,
+                Message = issue.Message
+            })
+            .ToList()
+    };
+
+    private static PlanStepError? CreatePlanStepError(ErrorInfo? error)
+    {
+        if (error is null)
+            return null;
+
+        return new PlanStepError
+        {
+            Code = error.Code,
+            Message = error.Message,
+            Details = error.Details?.DeepClone() as JsonObject
+        };
+    }
+
+    private static PlanStepError CreateVerificationError(string stepId, IReadOnlyCollection<StepVerificationIssue> verificationIssues)
+    {
+        var issues = new JsonArray();
+        foreach (var issue in verificationIssues)
+        {
+            issues.Add(new JsonObject
+            {
+                ["code"] = issue.Code,
+                ["message"] = issue.Message
+            });
+        }
+
+        return new PlanStepError
+        {
+            Code = "verification_failed",
+            Message = $"Step '{stepId}' produced output that failed verification.",
+            Details = new JsonObject
+            {
+                ["issues"] = issues
+            }
+        };
+    }
+
+    private static JsonObject? SerializeError(ErrorInfo? error)
+    {
+        if (error is null)
+            return null;
+
+        return new JsonObject
+        {
+            ["code"] = error.Code,
+            ["message"] = error.Message,
+            ["details"] = error.Details?.DeepClone()
+        };
+    }
+
+    private static string SerializeNode(JsonNode? node) =>
+        node?.ToJsonString(new JsonSerializerOptions { WriteIndented = false }) ?? "null";
 
     private static string Shorten(string? value, int maxLength)
     {
@@ -325,28 +479,5 @@ public sealed class PlanExecutor(
         return normalized.Length <= maxLength
             ? normalized
             : $"{normalized[..maxLength]}...";
-    }
-
-    // -----------------------------------------------------------------------
-
-    private static List<string> GetMissingRefs(PlanStep step, ExecutionStore store)
-    {
-        var missing = new List<string>();
-        foreach (var val in step.In.Values)
-        {
-            if (val is JsonValue jv && jv.TryGetValue<string>(out var s) && s.StartsWith('$'))
-            {
-                var expr = s[1..];
-                // Extract the base step ID before any [n] or .field accessor
-                var baseId = expr;
-                var bracketPos = expr.IndexOf('[');
-                var dotPos = expr.IndexOf('.');
-                if (bracketPos >= 0) baseId = expr[..bracketPos];
-                else if (dotPos >= 0) baseId = expr[..dotPos];
-
-                if (!store.TryGet(baseId, out _)) missing.Add(expr);
-            }
-        }
-        return missing;
     }
 }

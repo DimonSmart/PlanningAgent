@@ -5,7 +5,7 @@ public interface IPlanner
     Task<PlanDefinition> CreatePlanAsync(string userQuery, CancellationToken cancellationToken = default);
 }
 
-public interface IReplanCapablePlanner : IPlanner
+public interface IReplanner
 {
     Task<PlanDefinition> ReplanAsync(PlannerReplanRequest request, CancellationToken cancellationToken = default);
 }

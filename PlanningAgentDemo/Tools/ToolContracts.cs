@@ -35,7 +35,7 @@ public interface IToolRegistry
 
 public sealed class ToolRegistry(IEnumerable<ITool> tools) : IToolRegistry
 {
-    private readonly Dictionary<string, ITool> _tools = tools.ToDictionary(x => x.Name, StringComparer.Ordinal);
+    private readonly Dictionary<string, ITool> _tools = tools.ToDictionary(x => x.Name, StringComparer.OrdinalIgnoreCase);
 
     public ITool GetRequired(string name)
     {

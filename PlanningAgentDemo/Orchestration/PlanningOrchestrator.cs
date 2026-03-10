@@ -11,45 +11,47 @@ public sealed class PlanningOrchestrator(
     PlanExecutor executor,
     GoalVerifier? goalVerifier = null,
     IExecutionLogger? executionLogger = null,
-    int maxAttempts = 3)
+    int maxAttempts = 3,
+    IReplanner? replanner = null)
 {
     private readonly GoalVerifier _goalVerifier = goalVerifier ?? new GoalVerifier();
     private readonly IExecutionLogger _log = executionLogger ?? NullExecutionLogger.Instance;
     private readonly int _maxAttempts = maxAttempts;
+    private readonly IReplanner? _replanner = replanner;
 
     public async Task<ResultEnvelope<JsonNode?>> RunAsync(
-        string userQuery, CancellationToken cancellationToken = default)
+        string userQuery,
+        CancellationToken cancellationToken = default)
     {
+        PlanDefinition? plan = null;
         PlannerReplanRequest? replanRequest = null;
 
         for (var attempt = 1; attempt <= _maxAttempts; attempt++)
         {
-            _log.Log($"[orchestrator] attempt={attempt} phase={(replanRequest is null ? "plan" : "replan")}");
+            _log.Log($"[orchestrator] attempt={attempt} phase={(plan is null ? "plan" : "replan")}");
 
-            var plan = replanRequest is null
+            plan = plan is null
                 ? await planner.CreatePlanAsync(userQuery, cancellationToken)
-                : await CreateReplanAsync(replanRequest, cancellationToken);
+                : await CreateReplanAsync(replanRequest!, cancellationToken);
 
-            var store = new ExecutionStore();
-            var result = await executor.ExecuteAsync(plan, store, cancellationToken);
-            var verdict = _goalVerifier.Check(plan, result, store);
+            var result = await executor.ExecuteAsync(plan, cancellationToken);
+            var verdict = _goalVerifier.Check(plan, result);
 
             _log.Log($"[verify] goal:action={verdict.Action} reason={verdict.Reason}");
 
             if (verdict.Action == GoalAction.Done)
-            {
-                var lastStepId = plan.Steps[^1].Id;
-                store.TryGet(lastStepId, out var final);
-                return ResultEnvelope<JsonNode?>.Success(final?.DeepClone());
-            }
+                return ResultEnvelope<JsonNode?>.Success(plan.Steps[^1].Result?.DeepClone());
 
             if (verdict.Action == GoalAction.AskUser)
+            {
                 return ResultEnvelope<JsonNode?>.Failure(
                     "ask_user",
                     verdict.Reason,
                     new JsonObject { ["question"] = verdict.UserQuestion });
+            }
 
-            if (attempt == _maxAttempts || planner is not IReplanCapablePlanner)
+            if (attempt == _maxAttempts || _replanner is null)
+            {
                 return ResultEnvelope<JsonNode?>.Failure(
                     result.LastEnvelope?.Error?.Code ?? "goal_not_achieved",
                     verdict.Reason,
@@ -58,15 +60,15 @@ public sealed class PlanningOrchestrator(
                         ["missing"] = new JsonArray(verdict.Missing.Select(missingItem => JsonValue.Create(missingItem)).ToArray()),
                         ["attempt"] = attempt
                     });
+            }
 
             replanRequest = new PlannerReplanRequest
             {
                 UserQuery = userQuery,
                 AttemptNumber = attempt,
-                PreviousPlan = plan,
+                Plan = plan,
                 ExecutionResult = result,
-                GoalVerdict = verdict,
-                StoreSnapshot = store.CreateSnapshot()
+                GoalVerdict = verdict
             };
         }
 
@@ -75,9 +77,9 @@ public sealed class PlanningOrchestrator(
 
     private async Task<PlanDefinition> CreateReplanAsync(PlannerReplanRequest request, CancellationToken cancellationToken)
     {
-        if (planner is not IReplanCapablePlanner replanCapablePlanner)
-            return await planner.CreatePlanAsync(request.UserQuery, cancellationToken);
+        if (_replanner is null)
+            return request.Plan;
 
-        return await replanCapablePlanner.ReplanAsync(request, cancellationToken);
+        return await _replanner.ReplanAsync(request, cancellationToken);
     }
 }

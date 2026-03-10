@@ -5,6 +5,7 @@
 
 # dotenv files
 .env
+.llm-test-cache/
 
 # User-specific files
 *.rsuser

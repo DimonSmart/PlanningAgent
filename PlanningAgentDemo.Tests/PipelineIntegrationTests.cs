@@ -1,5 +1,9 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Microsoft.Agents.AI;
+using Microsoft.Extensions.AI;
+using OpenAI;
+using System.ClientModel;
 using PlanningAgentDemo.Agents;
 using PlanningAgentDemo.Common;
 using PlanningAgentDemo.Execution;
@@ -25,9 +29,9 @@ public class MockSearchTool : ITool
     public string Name => "search";
     public ToolPlannerMetadata PlannerMetadata => new(
         "search",
-        "Search the web. Returns an array of URLs matching the query.",
+        "Search the web. Returns candidate page URLs. In this test environment each returned URL points to a page that already contains details about one candidate item.",
         JsonNode.Parse(@"{""type"":""object"",""properties"":{""query"":{""type"":""string""},""limit"":{""type"":""number""}},""required"":[""query""]}")!.AsObject(),
-        new JsonObject(), [], []);
+        JsonNode.Parse(@"{""type"":""array"",""items"":{""type"":""string""}}")!.AsObject(), [], []);
 
     public Task<ResultEnvelope<JsonNode?>> ExecuteAsync(JsonObject input, CancellationToken ct = default) =>
         Task.FromResult(ResultEnvelope<JsonNode?>.Success(new JsonArray(
@@ -41,18 +45,26 @@ public class MockDownloadTool : ITool
     public string Name => "download";
     public ToolPlannerMetadata PlannerMetadata => new(
         "download",
-        "Download a web page. Takes a single URL and returns {title, body}.",
+        "Download a single page by URL. Returns an object with the page title and body text.",
         JsonNode.Parse(@"{""type"":""object"",""properties"":{""url"":{""type"":""string""}},""required"":[""url""]}")!.AsObject(),
-        new JsonObject(), [], []);
+        JsonNode.Parse(@"{""type"":""object"",""properties"":{""url"":{""type"":""string""},""title"":{""type"":""string""},""body"":{""type"":""string""}},""required"":[""url"",""title"",""body""]}")!.AsObject(), [], []);
 
     public Task<ResultEnvelope<JsonNode?>> ExecuteAsync(JsonObject input, CancellationToken ct = default)
     {
         var url = input["url"]?.GetValue<string>() ?? "";
         return url.Contains("item-a")
             ? Task.FromResult(ResultEnvelope<JsonNode?>.Success(new JsonObject
-                { ["url"] = url, ["title"] = "Item A", ["body"] = "Item A weighs 1.2 kg and runs for 20 min." }))
+                {
+                    ["url"] = url,
+                    ["title"] = "RoboClean A1 Max review",
+                    ["body"] = "RoboClean A1 Max is a popular robot vacuum cleaner with 7000 Pa suction power, up to 180 minutes of battery runtime, a 0.5 L dustbin, LiDAR navigation, and a list price of $799."
+                }))
             : Task.FromResult(ResultEnvelope<JsonNode?>.Success(new JsonObject
-                { ["url"] = url, ["title"] = "Item B", ["body"] = "Item B weighs 3.5 kg and runs for 45 min." }));
+                {
+                    ["url"] = url,
+                    ["title"] = "HomeSweep S5 review",
+                    ["body"] = "HomeSweep S5 is a popular robot vacuum cleaner with 5000 Pa suction power, up to 140 minutes of battery runtime, a 0.4 L dustbin, vSLAM navigation, and a list price of $649."
+                }));
     }
 }
 
@@ -60,14 +72,24 @@ public class MockDownloadTool : ITool
 
 public class PipelineTests(ITestOutputHelper output)
 {
+    private const string DevModel = "gpt-oss:120b-cloud";
+
     private static IToolRegistry BuildTools() =>
         new ToolRegistry(new ITool[] { new MockSearchTool(), new MockDownloadTool() });
 
-    private static ILlmClient BuildLlm(bool longTimeout = false)
+    private static IChatClient BuildChatClient(bool longTimeout = false)
     {
-        var http = new HttpClient { BaseAddress = new Uri("http://localhost:11434") };
-        if (longTimeout) http.Timeout = TimeSpan.FromMinutes(5);
-        return new OllamaLlmClient(http, OllamaLlmClient.DevModel);
+        _ = longTimeout;
+
+        var clientOptions = new OpenAIClientOptions
+        {
+            Endpoint = new Uri("http://localhost:11434/v1/")
+        };
+
+        var chatClient = new OpenAIClient(new ApiKeyCredential("ollama"), clientOptions)
+            .GetChatClient(DevModel);
+
+        return chatClient.AsIChatClient();
     }
 
     // -- Test 1: Executor with a plan whose agent prompts are written by us --
@@ -81,20 +103,20 @@ public class PipelineTests(ITestOutputHelper output)
     [Fact]
     public async Task Executor_RunsPlanWithEmbeddedAgentPrompts()
     {
-        var llm = BuildLlm();
-        var runner = new AgentStepRunner(llm);
+        var chatClient = BuildChatClient();
+        var runner = new AgentStepRunner(chatClient);
         var executor = new PlanExecutor(BuildTools(), runner, new TestLogger(output));
 
         var plan = new PlanDefinition
         {
-            Goal = "Search two items, extract key data from each page, then compare.",
+            Goal = "Find two robot vacuum models, extract key specs from each page, then compare them.",
             Steps =
             [
                 new PlanStep
                 {
                     Id = "search",
                     Tool = "search",
-                    In = new() { ["query"] = JsonValue.Create("item comparison"), ["limit"] = JsonValue.Create(2) }
+                    In = new() { ["query"] = JsonValue.Create("popular robot vacuum comparison"), ["limit"] = JsonValue.Create(2) }
                 },
                 new PlanStep
                 {
@@ -105,10 +127,10 @@ public class PipelineTests(ITestOutputHelper output)
                 },
                 new PlanStep
                 {
-                    Id = "extract",
-                    Llm = "extract_data",
-                    SystemPrompt = "You extract structured data from a page. Output ONLY valid JSON, no explanation.",
-                    UserPrompt = "Extract the item name, weight_kg (number or null), runtime_min (number or null). Return {\"name\":\"...\",\"weight_kg\":...,\"runtime_min\":...}.",
+                    Id = "extract_specs",
+                    Llm = "extract_specs",
+                    SystemPrompt = "You extract structured robot vacuum specifications from a page. Return ONLY valid JSON.",
+                    UserPrompt = "Extract the model name, suction_power_pa, battery_runtime_min, dustbin_capacity_l, navigation, and price_usd. Return a JSON object with those fields.",
                     In = new() { ["page"] = JsonValue.Create("$download") },
                     Each = true,   // fan-out: call once per downloaded page, collect results into array
                     Out = "json"
@@ -117,17 +139,16 @@ public class PipelineTests(ITestOutputHelper output)
                 {
                     Id = "compare",
                     Llm = "compare_items",
-                    SystemPrompt = "You compare items concisely. Output plain text only.",
-                    UserPrompt = "Given these two items, state which is lighter (winner for portability) and which has longer runtime. Be brief.",
-                    In = new() { ["items"] = JsonValue.Create("$extract") },
+                    SystemPrompt = "You compare two robot vacuum models and return ONLY valid JSON.",
+                    UserPrompt = "Compare the models and return {\"better_model\":\"...\",\"reason\":\"...\"}. Prefer better suction, longer battery runtime, larger dustbin, stronger navigation, and lower price when the trade-offs are close.",
+                    In = new() { ["items"] = JsonValue.Create("$extract_specs") },
                     // extract returns an array here � agent compares the full array in one call
-                    Out = "string"
+                    Out = "json"
                 }
             ]
         };
 
-        var store = new ExecutionStore();
-        var result = await executor.ExecuteAsync(plan, store);
+        var result = await executor.ExecuteAsync(plan);
 
         foreach (var t in result.StepTraces)
             output.WriteLine($"  step={t.StepId} success={t.Success} err={t.ErrorMessage}");
@@ -135,9 +156,10 @@ public class PipelineTests(ITestOutputHelper output)
         Assert.True(result.StepTraces.All(t => t.Success),
             $"Failed: {result.LastEnvelope?.Error?.Message}");
 
-        store.TryGet("compare", out var answer);
+        var answer = plan.Steps.Single(step => step.Id == "compare").Result;
         output.WriteLine($"\n=== FINAL ANSWER ===\n{answer?.ToString()}");
         Assert.NotNull(answer);
+        Assert.Equal("RoboClean A1 Max", answer?["better_model"]?.GetValue<string>());
     }
 
     // -- Test 2: Full pipeline  userQuery > Planner > Orchestrator ----------
@@ -150,16 +172,19 @@ public class PipelineTests(ITestOutputHelper output)
     [Fact]
     public async Task FullPipeline_PlannerAndOrchestrator_ReturnsSystemOutcome()
     {
-        var llm = BuildLlm(longTimeout: true);
-        var planner = new LlmPlanner(llm, BuildTools(), new TestLogger(output));
-        var runner = new AgentStepRunner(llm);
+        var chatClient = BuildChatClient(longTimeout: true);
+        var answerAsserter = new CachedLlmAnswerAsserter(chatClient, DevModel);
+        var planner = new LlmPlanner(chatClient, BuildTools(), new TestLogger(output));
+        var replanner = new LlmReplanner(chatClient, BuildTools(), new TestLogger(output));
+        var runner = new AgentStepRunner(chatClient);
         var executor = new PlanExecutor(BuildTools(), runner, new TestLogger(output));
         var orchestrator = new PlanningOrchestrator(
             planner,
             executor,
             new GoalVerifier(askUserEnabled: true),
             new TestLogger(output),
-            maxAttempts: 3);
+            maxAttempts: 3,
+            replanner: replanner);
 
         const string userQuery = "I'm looking for a good robot vacuum cleaner. Can you find two popular models, check their specs, and tell me which one is better?";
 
@@ -178,6 +203,7 @@ public class PipelineTests(ITestOutputHelper output)
 
         output.WriteLine($"\n=== GENERATED PLAN ===");
         output.WriteLine(JsonSerializer.Serialize(initialPlan, new JsonSerializerOptions { WriteIndented = true }));
+        AssertReasonableComparisonPlan(initialPlan);
 
         var result = await orchestrator.RunAsync(userQuery);
         var outcome = ClassifyOutcome(result);
@@ -193,6 +219,9 @@ public class PipelineTests(ITestOutputHelper output)
             case GoalAction.Done:
                 Assert.True(result.Ok);
                 Assert.NotNull(result.Data);
+                var verdict = await answerAsserter.EvaluateAsync(userQuery, result.Data);
+                output.WriteLine($"LLM asserter verdict: isAnswer={verdict.IsAnswer} cache={verdict.FromCache} comment={verdict.Comment}");
+                Assert.True(verdict.IsAnswer, verdict.Comment);
                 break;
 
             case GoalAction.AskUser:
@@ -211,6 +240,400 @@ public class PipelineTests(ITestOutputHelper output)
             default:
                 throw new InvalidOperationException($"Unexpected outcome: {outcome}");
         }
+    }
+
+    [Fact]
+    public async Task LlmPlanner_NormalizesCommonPlannerAliases_IntoExecutablePlan()
+    {
+        var planner = new LlmPlanner(
+            new StubChatClient(
+                """
+                {
+                  "goal": "Compare two robot vacuum cleaners.",
+                  "steps": [
+                    {
+                      "tool": "search",
+                      "query": "popular robot vacuum cleaner",
+                      "limit": 2
+                    },
+                    {
+                      "id": "download_pages",
+                      "tool": "download",
+                      "url": "$search"
+                    },
+                    {
+                      "id": "compare1",
+                      "agent": "compare_models",
+                      "system": "Return ONLY valid JSON.",
+                      "prompt": "Compare the provided items and recommend one model.",
+                      "items": "$download_pages"
+                    }
+                  ]
+                }
+                """),
+            BuildTools(),
+            new TestLogger(output));
+
+        var plan = await planner.CreatePlanAsync("Compare two popular robot vacuums.");
+
+        Assert.Equal("search", plan.Steps[0].Tool);
+        Assert.False(string.IsNullOrWhiteSpace(plan.Steps[0].Id));
+        Assert.Equal("popular robot vacuum cleaner", plan.Steps[0].In["query"]?.GetValue<string>());
+        Assert.Equal(2, plan.Steps[0].In["limit"]?.GetValue<int>());
+
+        Assert.Equal("download", plan.Steps[1].Tool);
+        Assert.Equal("$search", plan.Steps[1].In["url"]?.GetValue<string>());
+
+        Assert.Equal("compare_models", plan.Steps[2].Llm);
+        Assert.Equal("Return ONLY valid JSON.", plan.Steps[2].SystemPrompt);
+        Assert.Equal("Compare the provided items and recommend one model.", plan.Steps[2].UserPrompt);
+        Assert.Equal("json", plan.Steps[2].Out);
+        Assert.Equal("$download_pages", plan.Steps[2].In["items"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task AgentStepRunner_WithRealLlm_ReturnsStructuredFailure_WhenFactsAreMissing()
+    {
+        var runner = new AgentStepRunner(BuildChatClient(longTimeout: true));
+        var step = new PlanStep
+        {
+            Id = "extract_specs",
+            Llm = "extract_specs",
+            SystemPrompt = "You extract robot vacuum specifications from a page. Return ONLY valid JSON. If the model name or the requested facts are not present, do not guess and do not return a successful payload.",
+            UserPrompt = "Extract model_name, suction_power_pa, battery_runtime_min, dustbin_capacity_l, navigation, price_usd, and docking_station_wattage.",
+            In = new() { ["page"] = JsonValue.Create("stub") },
+            Out = "json"
+        };
+
+        var result = await runner.ExecuteAsync(
+            step,
+            new JsonObject
+            {
+                ["page"] = new JsonObject
+                {
+                    ["title"] = "Robot vacuum buying tips",
+                    ["body"] = "This page only says that robot vacuums are convenient for daily cleaning. It does not name a model and does not list technical specifications."
+                }
+            });
+
+        Assert.False(result.Ok);
+        Assert.Equal("llm_reported_issue", result.Error?.Code);
+        Assert.Equal("blocked", result.Error?.Details?["status"]?.GetValue<string>());
+        Assert.True(result.Error?.Details?["errors"] is JsonArray { Count: > 0 });
+    }
+
+    [Fact]
+    public async Task Orchestrator_ReplansAfterStructuredAgentFailure_WithRealLlm()
+    {
+        var chatClient = BuildChatClient(longTimeout: true);
+        var answerAsserter = new CachedLlmAnswerAsserter(chatClient, DevModel);
+        var planner = new StubPlanner(BuildBadInitialVacuumPlan());
+        var replanner = new CapturingReplanner(new LlmReplanner(chatClient, BuildTools(), new TestLogger(output)));
+        var runner = new AgentStepRunner(chatClient);
+        var executor = new PlanExecutor(BuildTools(), runner, new TestLogger(output));
+        var orchestrator = new PlanningOrchestrator(planner, executor, new GoalVerifier(), new TestLogger(output), maxAttempts: 2, replanner: replanner);
+
+        const string userQuery = "I'm looking for a good robot vacuum cleaner. Can you find two popular models, check their specs, and tell me which one is better?";
+
+        var result = await orchestrator.RunAsync(userQuery);
+
+        Assert.True(result.Ok);
+        Assert.Single(replanner.ReplanRequests);
+        var trace = Assert.Single(replanner.ReplanRequests[0].ExecutionResult.StepTraces, step => !step.Success);
+        Assert.Equal("llm_reported_issue", trace.ErrorCode);
+        Assert.Equal("blocked", trace.ErrorDetails?["status"]?.GetValue<string>());
+        Assert.True(trace.ErrorDetails?["errors"] is JsonArray { Count: > 0 });
+        var verdict = await answerAsserter.EvaluateAsync(userQuery, result.Data);
+        output.WriteLine($"LLM asserter verdict: isAnswer={verdict.IsAnswer} cache={verdict.FromCache} comment={verdict.Comment}");
+        Assert.True(verdict.IsAnswer, verdict.Comment);
+    }
+
+    [Fact]
+    public async Task Orchestrator_Replan_ReusesSuccessfulPrefixOutputs()
+    {
+        var searchTool = new CountingTool(new MockSearchTool());
+        var downloadTool = new CountingTool(new MockDownloadTool());
+        var tools = new ToolRegistry(new ITool[] { searchTool, downloadTool });
+
+        var initialPlan = BuildBadInitialVacuumPlan();
+        var replannedPlan = new PlanDefinition
+        {
+            Goal = initialPlan.Goal,
+            Steps =
+            [
+                initialPlan.Steps[0],
+                initialPlan.Steps[1],
+                new PlanStep
+                {
+                    Id = "extract_specs",
+                    Llm = "extract_specs",
+                    SystemPrompt = "Return ONLY valid JSON.",
+                    UserPrompt = "Extract model_name, suction_power_pa, battery_runtime_min, dustbin_capacity_l, navigation, and price_usd. Use null for absent fields.",
+                    In = new() { ["page"] = JsonValue.Create("$download") },
+                    Each = true,
+                    Out = "json"
+                },
+                initialPlan.Steps[3]
+            ]
+        };
+
+        var planner = new StubPlanner(initialPlan);
+        var replanner = new StubReplanner(replannedPlan);
+        var runner = new SequenceEnvelopeAgentRunner(
+            ResultEnvelope<JsonNode?>.Failure(
+                "llm_reported_issue",
+                "missing docking station wattage",
+                new JsonObject
+                {
+                    ["status"] = "blocked",
+                    ["needsReplan"] = true,
+                    ["errors"] = new JsonArray(
+                        new JsonObject
+                        {
+                            ["code"] = "missing_field",
+                            ["message"] = "missing docking station wattage",
+                            ["details"] = new JsonObject
+                            {
+                                ["missingFacts"] = new JsonArray("docking_station_wattage"),
+                                ["observedEvidence"] = "Page contains suction, battery, dustbin, navigation, and price."
+                            }
+                        })
+                }),
+            ResultEnvelope<JsonNode?>.Success(new JsonObject
+            {
+                ["model_name"] = "RoboClean A1 Max",
+                ["suction_power_pa"] = 7000,
+                ["battery_runtime_min"] = 180,
+                ["dustbin_capacity_l"] = 0.5,
+                ["navigation"] = "LiDAR",
+                ["price_usd"] = 799
+            }),
+            ResultEnvelope<JsonNode?>.Success(new JsonObject
+            {
+                ["model_name"] = "HomeSweep S5",
+                ["suction_power_pa"] = 5000,
+                ["battery_runtime_min"] = 140,
+                ["dustbin_capacity_l"] = 0.4,
+                ["navigation"] = "vSLAM",
+                ["price_usd"] = 649
+            }),
+            ResultEnvelope<JsonNode?>.Success(new JsonObject
+            {
+                ["better_model"] = "RoboClean A1 Max",
+                ["reason"] = "Higher suction and battery runtime."
+            }));
+        var executor = new PlanExecutor(tools, runner, new TestLogger(output));
+        var orchestrator = new PlanningOrchestrator(planner, executor, new GoalVerifier(), new TestLogger(output), maxAttempts: 2, replanner: replanner);
+
+        var result = await orchestrator.RunAsync("compare two robot vacuums");
+
+        Assert.True(result.Ok);
+        Assert.Equal(1, searchTool.CallCount);
+        Assert.Equal(2, downloadTool.CallCount);
+    }
+
+    [Fact]
+    public async Task LlmReplanner_CanReadCompactFailedTrace_BeforeEditingPlan()
+    {
+        var replanner = new LlmReplanner(
+            new SequenceChatClient(
+                """
+                {
+                  "done": false,
+                  "reason": "Need the failed trace details.",
+                  "actions": [
+                    {
+                      "tool": "runtime.readFailedTrace",
+                      "in": { "stepId": "extract" }
+                    }
+                  ]
+                }
+                """,
+                """
+                {
+                  "done": true,
+                  "reason": "Replace the failed extraction step.",
+                  "actions": [
+                    {
+                      "tool": "plan.replaceStep",
+                      "in": {
+                        "stepId": "extract",
+                        "step": {
+                          "id": "extract",
+                          "llm": "extract",
+                          "systemPrompt": "Return ONLY valid JSON. Use null for missing facts.",
+                          "userPrompt": "Extract model_name and suction_power_pa.",
+                          "in": { "page": "$download" },
+                          "out": "json",
+                          "each": true
+                        }
+                      }
+                    }
+                  ]
+                }
+                """),
+            BuildTools(),
+            new TestLogger(output));
+
+        var previousPlan = new PlanDefinition
+        {
+            Goal = "Extract and compare product data.",
+            Steps =
+            [
+                new PlanStep
+                {
+                    Id = "search",
+                    Tool = "search",
+                    In = new() { ["query"] = JsonValue.Create("robot vacuum"), ["limit"] = JsonValue.Create(2) }
+                },
+                new PlanStep
+                {
+                    Id = "download",
+                    Tool = "download",
+                    In = new() { ["url"] = JsonValue.Create("$search") }
+                },
+                new PlanStep
+                {
+                    Id = "extract",
+                    Llm = "extract",
+                    SystemPrompt = "Return ONLY valid JSON.",
+                    UserPrompt = "Extract model_name and docking_station_wattage.",
+                    In = new() { ["page"] = JsonValue.Create("$download") },
+                    Each = true,
+                    Out = "json"
+                }
+            ]
+        };
+
+        var replanned = await replanner.ReplanAsync(new PlannerReplanRequest
+        {
+            UserQuery = "compare two robot vacuums",
+            AttemptNumber = 1,
+            Plan = previousPlan,
+            ExecutionResult = new ExecutionResult
+            {
+                StepTraces =
+                [
+                    new StepExecutionTrace
+                    {
+                        StepId = "download",
+                        Success = true
+                    },
+                    new StepExecutionTrace
+                    {
+                        StepId = "extract",
+                        Success = false,
+                        ErrorCode = "llm_reported_issue",
+                        ErrorMessage = "missing docking station wattage",
+                        ErrorDetails = new JsonObject
+                        {
+                            ["status"] = "blocked",
+                            ["needsReplan"] = true,
+                            ["errors"] = new JsonArray(
+                                new JsonObject
+                                {
+                                    ["code"] = "missing_field",
+                                    ["message"] = "missing docking station wattage",
+                                    ["details"] = new JsonObject
+                                    {
+                                        ["missingFacts"] = new JsonArray("docking_station_wattage"),
+                                        ["observedEvidence"] = "The downloaded page contains suction power and price only."
+                                    }
+                                })
+                        }
+                    }
+                ]
+            },
+            GoalVerdict = new GoalVerdict
+            {
+                Action = GoalAction.Replan,
+                Reason = "Execution has failed steps.",
+                Missing = ["successful_execution"]
+            }
+        });
+
+        Assert.Same(previousPlan, replanned);
+        var extract = Assert.Single(replanned.Steps, step => step.Id == "extract");
+        Assert.Equal("Return ONLY valid JSON. Use null for missing facts.", extract.SystemPrompt);
+    }
+
+    [Fact]
+    public void PlanEditingSession_ReplaceStep_ResetsChangedStepAndDownstreamState()
+    {
+        var plan = new PlanDefinition
+        {
+            Goal = "Compare two models.",
+            Steps =
+            [
+                new PlanStep
+                {
+                    Id = "search",
+                    Tool = "search",
+                    In = new() { ["query"] = JsonValue.Create("robot vacuum") },
+                    Status = PlanStepStatuses.Done,
+                    Result = new JsonArray("https://example.com/a", "https://example.com/b")
+                },
+                new PlanStep
+                {
+                    Id = "extract",
+                    Llm = "extract_specs",
+                    SystemPrompt = "Return ONLY valid JSON.",
+                    UserPrompt = "Extract model_name.",
+                    In = new() { ["page"] = JsonValue.Create("$search") },
+                    Out = "json",
+                    Each = true,
+                    Status = PlanStepStatuses.Fail,
+                    Result = new JsonArray(),
+                    Error = new PlanStepError { Code = "llm_reported_issue", Message = "missing facts" }
+                },
+                new PlanStep
+                {
+                    Id = "compare",
+                    Llm = "compare_models",
+                    SystemPrompt = "Return ONLY valid JSON.",
+                    UserPrompt = "Compare the models.",
+                    In = new() { ["items"] = JsonValue.Create("$extract") },
+                    Out = "json",
+                    Status = PlanStepStatuses.Done,
+                    Result = new JsonObject { ["better_model"] = "stale" }
+                }
+            ]
+        };
+
+        var session = new PlanEditingSession(plan);
+        var action = JsonNode.Parse(
+            """
+            {
+              "tool": "plan.replaceStep",
+              "in": {
+                "stepId": "extract",
+                "step": {
+                  "id": "extract",
+                  "llm": "extract_specs",
+                  "systemPrompt": "Return ONLY valid JSON. Use null for missing facts.",
+                  "userPrompt": "Extract model_name and suction_power_pa.",
+                  "in": { "page": "$search" },
+                  "out": "json",
+                  "each": true
+                }
+              }
+            }
+            """)!.AsObject();
+
+        var result = session.ExecuteAction(action);
+
+        Assert.True(result["ok"]?.GetValue<bool>());
+        Assert.Equal(PlanStepStatuses.Done, plan.Steps[0].Status);
+        Assert.NotNull(plan.Steps[0].Result);
+
+        Assert.Equal(PlanStepStatuses.Todo, plan.Steps[1].Status);
+        Assert.Null(plan.Steps[1].Result);
+        Assert.Null(plan.Steps[1].Error);
+        Assert.Equal("Extract model_name and suction_power_pa.", plan.Steps[1].UserPrompt);
+
+        Assert.Equal(PlanStepStatuses.Todo, plan.Steps[2].Status);
+        Assert.Null(plan.Steps[2].Result);
+        Assert.Null(plan.Steps[2].Error);
     }
 
     [Fact]
@@ -235,10 +658,10 @@ public class PipelineTests(ITestOutputHelper output)
             ]
         };
 
-        var store = new ExecutionStore();
-        store.Set("compare", JsonValue.Create("final answer"));
+        plan.Steps[1].Status = PlanStepStatuses.Done;
+        plan.Steps[1].Result = JsonValue.Create("final answer");
 
-        var verdict = new GoalVerifier().Check(plan, executionResult, store);
+        var verdict = new GoalVerifier().Check(plan, executionResult);
 
         Assert.Equal(GoalAction.Done, verdict.Action);
     }
@@ -286,7 +709,7 @@ public class PipelineTests(ITestOutputHelper output)
         var result = await orchestrator.RunAsync("compare items");
 
         Assert.False(result.Ok);
-        Assert.Equal("goal_not_achieved", result.Error?.Code);
+        Assert.Equal("verification_failed", result.Error?.Code);
         Assert.Contains("incomplete", result.Error?.Message, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -327,26 +750,27 @@ public class PipelineTests(ITestOutputHelper output)
             ]
         };
 
-        var planner = new StubReplanPlanner(firstPlan, secondPlan);
+        var planner = new StubPlanner(firstPlan);
+        var replanner = new StubReplanner(secondPlan);
         var runner = new StubAgentRunner(
             new JsonObject { ["field"] = "" },
             new JsonObject { ["answer"] = "done" });
         var executor = new PlanExecutor(BuildTools(), runner, new TestLogger(output));
-        var orchestrator = new PlanningOrchestrator(planner, executor, new GoalVerifier(), new TestLogger(output), maxAttempts: 2);
+        var orchestrator = new PlanningOrchestrator(planner, executor, new GoalVerifier(), new TestLogger(output), maxAttempts: 2, replanner: replanner);
 
         var result = await orchestrator.RunAsync("answer the user query");
 
         Assert.True(result.Ok);
         Assert.NotNull(result.Data);
-        Assert.Single(planner.ReplanRequests);
-        Assert.Contains(planner.ReplanRequests[0].ExecutionResult.StepTraces[0].VerificationIssues,
+        Assert.Single(replanner.ReplanRequests);
+        Assert.Contains(replanner.ReplanRequests[0].ExecutionResult.StepTraces[0].VerificationIssues,
             issue => issue.Code == "structurally_empty_output");
     }
 
     [Fact]
     public async Task AgentStepRunner_ReturnsFailure_WhenAgentReportsStructuredExecutionIssue()
     {
-        var llm = new StubLlmClient("""
+                var chatClient = new StubChatClient("""
         {
           "_execution": {
             "status": "blocked",
@@ -358,7 +782,7 @@ public class PipelineTests(ITestOutputHelper output)
           "result": null
         }
         """);
-        var runner = new AgentStepRunner(llm);
+        var runner = new AgentStepRunner(chatClient);
 
         var step = new PlanStep
         {
@@ -414,8 +838,9 @@ public class PipelineTests(ITestOutputHelper output)
             ]
         };
 
-        var planner = new StubReplanPlanner(firstPlan, secondPlan);
-        var llm = new SequenceLlmClient(
+        var planner = new StubPlanner(firstPlan);
+        var replanner = new StubReplanner(secondPlan);
+                var chatClient = new SequenceChatClient(
             """
             {
               "_execution": {
@@ -433,18 +858,141 @@ public class PipelineTests(ITestOutputHelper output)
               "answer": "done"
             }
             """);
-        var runner = new AgentStepRunner(llm);
+                var runner = new AgentStepRunner(chatClient);
         var executor = new PlanExecutor(BuildTools(), runner, new TestLogger(output));
-        var orchestrator = new PlanningOrchestrator(planner, executor, new GoalVerifier(), new TestLogger(output), maxAttempts: 2);
+        var orchestrator = new PlanningOrchestrator(planner, executor, new GoalVerifier(), new TestLogger(output), maxAttempts: 2, replanner: replanner);
 
         var result = await orchestrator.RunAsync("answer the user query");
 
         Assert.True(result.Ok);
-        Assert.Single(planner.ReplanRequests);
-        var trace = Assert.Single(planner.ReplanRequests[0].ExecutionResult.StepTraces);
+        Assert.Single(replanner.ReplanRequests);
+        var trace = Assert.Single(replanner.ReplanRequests[0].ExecutionResult.StepTraces);
         Assert.Equal("llm_reported_issue", trace.ErrorCode);
         Assert.Equal("blocked", trace.ErrorDetails?["status"]?.GetValue<string>());
     }
+
+    private static void AssertReasonableComparisonPlan(PlanDefinition plan)
+    {
+        Assert.True(plan.Steps.Count >= 4, "Plan should contain at least search, download, extract, and compare phases.");
+
+        var search = plan.Steps[0];
+        Assert.Equal("search", search.Tool);
+        Assert.True(string.IsNullOrWhiteSpace(search.Llm));
+
+        var downloadSteps = plan.Steps
+            .Where(step => string.Equals(step.Tool, "download", StringComparison.Ordinal))
+            .ToList();
+        Assert.NotEmpty(downloadSteps);
+        Assert.All(downloadSteps, step => Assert.True(ReferencesAnyStep(step, [search.Id])));
+
+        var extractSteps = plan.Steps
+            .Where(step => string.IsNullOrWhiteSpace(step.Tool) && !string.IsNullOrWhiteSpace(step.Llm))
+            .Where(step => step.Id != plan.Steps[^1].Id)
+            .Where(step => ReferencesAnyStep(step, downloadSteps.Select(downloadStep => downloadStep.Id)))
+            .ToList();
+        Assert.NotEmpty(extractSteps);
+
+        var compare = plan.Steps[^1];
+        Assert.True(string.IsNullOrWhiteSpace(compare.Tool));
+        Assert.False(string.IsNullOrWhiteSpace(compare.Llm));
+        Assert.True(ReferencesAnyStep(compare, extractSteps.Select(extractStep => extractStep.Id)));
+    }
+
+    private static bool ReferencesAnyStep(PlanStep step, IEnumerable<string> stepIds)
+    {
+        var stepIdSet = stepIds.ToHashSet(StringComparer.Ordinal);
+        foreach (var value in step.In.Values)
+        {
+            if (value is not JsonValue jsonValue || !jsonValue.TryGetValue<string>(out var text) || !text.StartsWith("$", StringComparison.Ordinal))
+                continue;
+
+            var candidate = text[1..];
+            var bracketIndex = candidate.IndexOf('[');
+            var dotIndex = candidate.IndexOf('.');
+            var endIndex = bracketIndex >= 0 && dotIndex >= 0
+                ? Math.Min(bracketIndex, dotIndex)
+                : bracketIndex >= 0
+                    ? bracketIndex
+                    : dotIndex;
+            var stepId = endIndex >= 0 ? candidate[..endIndex] : candidate;
+            if (stepIdSet.Contains(stepId))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static void AssertMeaningfulVacuumAnswer(JsonNode? answer)
+    {
+        Assert.NotNull(answer);
+
+        switch (answer)
+        {
+            case JsonObject obj:
+                var betterModel =
+                    obj["betterModel"]?.GetValue<string>()
+                    ?? obj["better_model"]?.GetValue<string>()
+                    ?? obj["recommended_model"]?.GetValue<string>()
+                    ?? obj["recommendedModel"]?.GetValue<string>()
+                    ?? obj["bestModel"]?.GetValue<string>()
+                    ?? obj["preferredModel"]?.GetValue<string>();
+                Assert.False(string.IsNullOrWhiteSpace(betterModel));
+                Assert.True(
+                    betterModel.Contains("RoboClean", StringComparison.OrdinalIgnoreCase)
+                    || betterModel.Contains("A1", StringComparison.OrdinalIgnoreCase));
+                break;
+
+            case JsonValue value when value.TryGetValue<string>(out var text):
+                Assert.False(string.IsNullOrWhiteSpace(text));
+                Assert.True(
+                    text.Contains("RoboClean", StringComparison.OrdinalIgnoreCase)
+                    || text.Contains("A1", StringComparison.OrdinalIgnoreCase));
+                break;
+
+            default:
+                throw new Xunit.Sdk.XunitException($"Unexpected final answer node: {answer}");
+        }
+    }
+
+    private static PlanDefinition BuildBadInitialVacuumPlan() =>
+        new()
+        {
+            Goal = "Find two robot vacuum models, inspect their specifications, and decide which one is better.",
+            Steps =
+            [
+                new PlanStep
+                {
+                    Id = "search",
+                    Tool = "search",
+                    In = new() { ["query"] = JsonValue.Create("popular robot vacuum cleaner"), ["limit"] = JsonValue.Create(2) }
+                },
+                new PlanStep
+                {
+                    Id = "download",
+                    Tool = "download",
+                    In = new() { ["url"] = JsonValue.Create("$search") }
+                },
+                new PlanStep
+                {
+                    Id = "extract_specs",
+                    Llm = "extract_specs",
+                    SystemPrompt = "You extract robot vacuum specifications from a page. Return ONLY valid JSON. If any requested field is absent, return a blocked execution error instead of a successful payload.",
+                    UserPrompt = "Extract model_name, suction_power_pa, battery_runtime_min, dustbin_capacity_l, navigation, price_usd, and docking_station_wattage.",
+                    In = new() { ["page"] = JsonValue.Create("$download") },
+                    Each = true,
+                    Out = "json"
+                },
+                new PlanStep
+                {
+                    Id = "compare",
+                    Llm = "compare_models",
+                    SystemPrompt = "You compare robot vacuum models and return ONLY valid JSON.",
+                    UserPrompt = "Compare the models and return {\"better_model\":\"...\",\"reason\":\"...\"}.",
+                    In = new() { ["items"] = JsonValue.Create("$extract_specs") },
+                    Out = "json"
+                }
+            ]
+        };
 
     private sealed class StubPlanner(PlanDefinition plan) : IPlanner
     {
@@ -452,17 +1000,48 @@ public class PipelineTests(ITestOutputHelper output)
             Task.FromResult(plan);
     }
 
-    private sealed class StubReplanPlanner(PlanDefinition initialPlan, PlanDefinition replannedPlan) : IReplanCapablePlanner
+    private sealed class StubReplanner(PlanDefinition replannedPlan) : IReplanner
     {
         public List<PlannerReplanRequest> ReplanRequests { get; } = [];
-
-        public Task<PlanDefinition> CreatePlanAsync(string userQuery, CancellationToken cancellationToken = default) =>
-            Task.FromResult(initialPlan);
 
         public Task<PlanDefinition> ReplanAsync(PlannerReplanRequest request, CancellationToken cancellationToken = default)
         {
             ReplanRequests.Add(request);
-            return Task.FromResult(replannedPlan);
+            request.Plan.Steps.Clear();
+            foreach (var step in replannedPlan.Steps.Select(CloneStep))
+                request.Plan.Steps.Add(step);
+
+            return Task.FromResult(request.Plan);
+        }
+
+        private static PlanStep CloneStep(PlanStep step) =>
+            JsonSerializer.Deserialize<PlanStep>(JsonSerializer.Serialize(step))
+            ?? throw new InvalidOperationException($"Failed to clone step '{step.Id}'.");
+    }
+
+    private sealed class CapturingReplanner(IReplanner replanner) : IReplanner
+    {
+        public List<PlannerReplanRequest> ReplanRequests { get; } = [];
+
+        public async Task<PlanDefinition> ReplanAsync(PlannerReplanRequest request, CancellationToken cancellationToken = default)
+        {
+            ReplanRequests.Add(request);
+            return await replanner.ReplanAsync(request, cancellationToken);
+        }
+    }
+
+    private sealed class CountingTool(ITool innerTool) : ITool
+    {
+        public int CallCount { get; private set; }
+
+        public string Name => innerTool.Name;
+
+        public ToolPlannerMetadata PlannerMetadata => innerTool.PlannerMetadata;
+
+        public async Task<ResultEnvelope<JsonNode?>> ExecuteAsync(JsonObject input, CancellationToken ct = default)
+        {
+            CallCount++;
+            return await innerTool.ExecuteAsync(input, ct);
         }
     }
 
@@ -477,18 +1056,58 @@ public class PipelineTests(ITestOutputHelper output)
         }
     }
 
-    private sealed class StubLlmClient(string response) : ILlmClient
+    private sealed class SequenceEnvelopeAgentRunner(params ResultEnvelope<JsonNode?>[] outputs) : IAgentStepRunner
     {
-        public Task<string> GenerateAsync(string systemPrompt, string userPrompt, CancellationToken cancellationToken = default) =>
-            Task.FromResult(response);
+        private readonly Queue<ResultEnvelope<JsonNode?>> _outputs = new(outputs.Select(CloneEnvelope));
+
+        public Task<ResultEnvelope<JsonNode?>> ExecuteAsync(PlanStep step, JsonObject resolvedInputs, CancellationToken cancellationToken = default)
+        {
+            var next = _outputs.Dequeue();
+            return Task.FromResult(CloneEnvelope(next));
+        }
+
+        private static ResultEnvelope<JsonNode?> CloneEnvelope(ResultEnvelope<JsonNode?> envelope)
+        {
+            if (envelope.Ok)
+                return ResultEnvelope<JsonNode?>.Success(envelope.Data?.DeepClone());
+
+            return ResultEnvelope<JsonNode?>.Failure(
+                envelope.Error?.Code ?? "unknown_error",
+                envelope.Error?.Message ?? "unknown error",
+                envelope.Error?.Details?.DeepClone() as JsonObject);
+        }
     }
 
-    private sealed class SequenceLlmClient(params string[] responses) : ILlmClient
+    private sealed class StubChatClient(string response) : IChatClient
+    {
+        public Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, response)));
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default) =>
+            AsyncEnumerable.Empty<ChatResponseUpdate>();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public void Dispose()
+        {
+        }
+    }
+
+    private sealed class SequenceChatClient(params string[] responses) : IChatClient
     {
         private readonly Queue<string> _responses = new(responses);
 
-        public Task<string> GenerateAsync(string systemPrompt, string userPrompt, CancellationToken cancellationToken = default) =>
-            Task.FromResult(_responses.Dequeue());
+        public Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, _responses.Dequeue())));
+
+        public IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default) =>
+            AsyncEnumerable.Empty<ChatResponseUpdate>();
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public void Dispose()
+        {
+        }
     }
 
     private static GoalAction ClassifyOutcome(ResultEnvelope<JsonNode?> result)

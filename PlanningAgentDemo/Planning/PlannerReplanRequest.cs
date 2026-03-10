@@ -1,4 +1,3 @@
-using System.Text.Json.Nodes;
 using PlanningAgentDemo.Execution;
 using PlanningAgentDemo.Verification;
 
@@ -10,11 +9,9 @@ public sealed class PlannerReplanRequest
 
     public int AttemptNumber { get; init; }
 
-    public PlanDefinition PreviousPlan { get; init; } = new();
+    public PlanDefinition Plan { get; init; } = new();
 
     public ExecutionResult ExecutionResult { get; init; } = new();
 
     public GoalVerdict GoalVerdict { get; init; } = new();
-
-    public JsonObject StoreSnapshot { get; init; } = [];
 }

@@ -6,21 +6,11 @@ namespace PlanningAgentDemo.Verification;
 
 public sealed class GoalVerifier(bool askUserEnabled = false)
 {
-    public GoalVerdict Check(PlanDefinition plan, ExecutionResult executionResult, ExecutionStore store)
+    public GoalVerdict Check(PlanDefinition plan, ExecutionResult executionResult)
     {
-        if (executionResult.HasErrors)
-        {
-            return new GoalVerdict
-            {
-                Action = GoalAction.Replan,
-                Reason = "Execution has failed steps.",
-                Missing = ["successful_execution"]
-            };
-        }
-
-        var verificationIssues = executionResult.StepTraces
-            .Where(trace => trace.VerificationIssues.Count > 0)
-            .SelectMany(trace => trace.VerificationIssues.Select(issue => $"{trace.StepId}:{issue.Code}"))
+        var verificationIssues = plan.Steps
+            .Where(step => string.Equals(step.Error?.Code, "verification_failed", StringComparison.Ordinal))
+            .SelectMany(step => ExtractVerificationIssues(step.Id, step.Error?.Details))
             .ToList();
 
         if (verificationIssues.Count > 0)
@@ -33,17 +23,29 @@ public sealed class GoalVerifier(bool askUserEnabled = false)
             };
         }
 
-        var lastStepId = plan.Steps[^1].Id;
-        if (!store.TryGet(lastStepId, out var finalNode) || finalNode is null)
+        var failedSteps = plan.Steps.Where(PlanExecutionState.IsFailed).ToList();
+        if (failedSteps.Count > 0)
         {
             return new GoalVerdict
             {
                 Action = GoalAction.Replan,
-                Reason = $"Store does not contain final result for step '{lastStepId}'.",
-                Missing = [lastStepId]
+                Reason = "Execution has failed steps.",
+                Missing = failedSteps.Select(step => step.Id).ToList()
             };
         }
 
+        var finalStep = plan.Steps[^1];
+        if (!PlanExecutionState.IsDone(finalStep) || finalStep.Result is null)
+        {
+            return new GoalVerdict
+            {
+                Action = GoalAction.Replan,
+                Reason = $"Plan does not contain a completed final result for step '{finalStep.Id}'.",
+                Missing = [finalStep.Id]
+            };
+        }
+
+        var finalNode = finalStep.Result;
         if (finalNode is JsonObject finalObj && finalObj.Count == 0)
         {
             return new GoalVerdict
@@ -91,5 +93,17 @@ public sealed class GoalVerifier(bool askUserEnabled = false)
             Action = GoalAction.Done,
             Reason = "Goal achieved."
         };
+    }
+
+    private static IReadOnlyCollection<string> ExtractVerificationIssues(string stepId, JsonObject? errorDetails)
+    {
+        if (errorDetails?["issues"] is not JsonArray issues)
+            return [$"{stepId}:verification_failed"];
+
+        return issues
+            .Select(issue => issue?["code"]?.GetValue<string>())
+            .Where(code => !string.IsNullOrWhiteSpace(code))
+            .Select(code => $"{stepId}:{code}")
+            .ToList();
     }
 }
